@@ -1,0 +1,160 @@
+#!/bin/sh
+# Голос Discord: запускает nfqws и направляет к нему первые UDP-пакеты голосовых портов.
+# Запускается от root, поэтому принимает только профиль из списка и имя интерфейса.
+#
+#   byedpi-tg-voice start [профиль] [интерфейс]
+#   byedpi-tg-voice stop
+#   byedpi-tg-voice status
+#
+# Правила и процесс не переживают перезагрузку: автозапуска нет.
+set -u
+umask 022
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+NFQWS=/usr/local/lib/byedpi-tg/nfqws
+FAKE_DIR=/usr/local/lib/byedpi-tg/fake
+PIDFILE=/run/byedpi-tg-voice.pid
+STATE=/run/byedpi-tg-voice.state
+CHAIN=BYEDPI_VOICE
+QNUM=2046
+PORTS_NFQ=19294-19344,50000-50100
+PORTS_IPT=19294:19344,50000:50100
+# Голосу хватает обработки начала потока, дальше звук идёт мимо nfqws
+FIRST_PACKETS=12
+# Метка, которой nfqws помечает свои пакеты (значение по умолчанию в nfqws)
+FWMARK=0x40000000
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+ipt() { iptables -w 5 -t mangle "$@"; }
+
+profile_args() {  # Профили основаны на общих настройках zapret для голоса Discord
+    quic="@$FAKE_DIR/quic_initial_www_google_com.bin"
+    stun="@$FAKE_DIR/stun.bin"
+    case "$1" in
+        quic6) ARGS="--filter-l7=discord,stun --dpi-desync=fake --dpi-desync-fake-discord=$quic --dpi-desync-fake-stun=$quic --dpi-desync-repeats=6" ;;
+        quic11) ARGS="--filter-l7=discord,stun --dpi-desync=fake --dpi-desync-fake-discord=$quic --dpi-desync-fake-stun=$quic --dpi-desync-repeats=11" ;;
+        stun3) ARGS="--filter-l7=discord,stun --dpi-desync=fake --dpi-desync-fake-discord=$stun --dpi-desync-fake-discord=$quic --dpi-desync-fake-stun=$quic --dpi-desync-repeats=3" ;;
+        wide) ARGS="--filter-l7=discord,stun,unknown --dpi-desync=fake --dpi-desync-any-protocol=1 --dpi-desync-fake-discord=$quic --dpi-desync-fake-stun=$quic --dpi-desync-fake-unknown-udp=$quic --dpi-desync-repeats=4 --dpi-desync-cutoff=n4" ;;
+        *) die "Неизвестный профиль: $1 (есть quic6, quic11, stun3, wide)" ;;
+    esac
+}
+
+valid_iface() {
+    case "$1" in
+        ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 15 ] && [ -d "/sys/class/net/$1" ]
+}
+
+default_iface() {
+    # Маршруты 0.0.0.0/1 у VPN сюда не попадают, поэтому при включённом VPN это физический выход.
+    dev=$(ip -4 route show default | awk 'NR==1 { for (i=1;i<NF;i++) if ($i=="dev") print $(i+1) }')
+    [ -n "$dev" ] || die "Нет маршрута по умолчанию. Укажи интерфейс явно."
+    if [ ! -e "/sys/class/net/$dev/device" ]; then
+        case "$dev" in
+            ppp*|wwan*|br*|bond*|vlan*|*.*) ;;
+            *) die "Маршрут по умолчанию идёт через виртуальный интерфейс $dev (похоже на VPN). Укажи настоящий интерфейс явно." ;;
+        esac
+    fi
+    printf '%s\n' "$dev"
+}
+
+running_pid() {
+    [ -r "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "nfqws" ] || return 1
+    printf '%s\n' "$pid"
+}
+
+remove_rules() {
+    ipt -S POSTROUTING 2>/dev/null | grep -- "-j $CHAIN\$" | sed 's/^-A /-D /' | while read -r rule; do
+        # shellcheck disable=SC2086  # строка взята из вывода iptables
+        ipt $rule
+    done
+    ipt -F "$CHAIN" 2>/dev/null
+    ipt -X "$CHAIN" 2>/dev/null
+    return 0
+}
+
+stop_all() {
+    remove_rules
+    if pid=$(running_pid); then
+        kill "$pid" 2>/dev/null
+        i=0
+        while [ -d "/proc/$pid" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+        [ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$PIDFILE" "$STATE"
+}
+
+add_rules() {  # $1 = интерфейс
+    ipt -N "$CHAIN" || return 1
+    # Адреса с отдельным маршрутом через этот выход (например, сервер VPN) не трогаем
+    for ip in $(ip -4 route show dev "$1" | awk '$2=="via" && $1 ~ /^[0-9.]+$/ { print $1 }'); do
+        ipt -A "$CHAIN" -d "$ip" -j RETURN || return 1
+    done
+    # --queue-bypass: если nfqws упадёт, пакеты пойдут дальше, а не потеряются
+    ipt -A "$CHAIN" -p udp -m multiport --dports "$PORTS_IPT" \
+        -m connbytes --connbytes-dir=original --connbytes-mode=packets --connbytes "1:$FIRST_PACKETS" \
+        -m mark ! --mark "$FWMARK/$FWMARK" \
+        -j NFQUEUE --queue-num "$QNUM" --queue-bypass || return 1
+    ipt -A POSTROUTING -o "$1" -p udp -j "$CHAIN" || return 1
+}
+
+start() {
+    profile=${1:-quic6}
+    profile_args "$profile"
+    if [ -n "${2:-}" ]; then
+        iface=$2
+    else
+        iface=$(default_iface) || exit 1
+    fi
+    valid_iface "$iface" || die "Неверный интерфейс: $iface"
+    [ -x "$NFQWS" ] || die "Нет $NFQWS. Установи режим: ./install.sh voice"
+    command -v iptables >/dev/null || die "Нужен iptables."
+
+    # shellcheck disable=SC2086  # ARGS собран из фиксированных строк без пробелов в значениях
+    set -- --qnum="$QNUM" --filter-udp="$PORTS_NFQ" $ARGS
+    err=$("$NFQWS" --dry-run "$@" 2>&1) || die "nfqws отверг параметры профиля $profile: $err"
+
+    stop_all
+    for m in iptable_mangle nfnetlink_queue xt_NFQUEUE xt_connbytes xt_multiport xt_mark; do
+        modprobe -q "$m" 2>/dev/null
+    done
+
+    err=$("$NFQWS" --daemon --pidfile="$PIDFILE" "$@" 2>&1)
+    rc=$?
+    i=0
+    while ! running_pid >/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done
+    sleep 0.3  # ошибка привязки к очереди проявляется уже после ухода в фон
+    if [ "$rc" -ne 0 ] || ! pid=$(running_pid); then
+        stop_all
+        die "nfqws не запустился: $err"
+    fi
+    if ! add_rules "$iface"; then
+        stop_all
+        die "Не удалось добавить правила iptables. Всё откатил."
+    fi
+    printf 'pid=%s\niface=%s\nprofile=%s\n' "$pid" "$iface" "$profile" > "$STATE"
+    printf 'Запущено: %s, профиль %s\n' "$iface" "$profile"
+}
+
+status() {
+    if pid=$(running_pid) && ipt -S "$CHAIN" >/dev/null 2>&1; then
+        cat "$STATE"
+        ipt -nvL "$CHAIN"
+        return 0
+    fi
+    echo "Не запущено"
+    return 3
+}
+
+[ "$(id -u)" = 0 ] || die "Нужны права root."
+case "${1:-}" in
+    start) shift; start "$@" ;;
+    stop) stop_all; echo "Остановлено" ;;
+    status) status ;;
+    *) die "Использование: byedpi-tg-voice start [профиль] [интерфейс] | stop | status" ;;
+esac

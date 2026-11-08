@@ -2,6 +2,7 @@
 # Установка ByeDPI × TG Desktop (рассчитано на Void Linux, работает и на других дистрах)
 #   ./install.sh            — установить / обновить
 #   ./install.sh voice      — добавить голос Discord: собрать nfqws и поставить хелпер (нужен sudo)
+#   ./install.sh tun        — добавить режим TUN: весь TCP системы через byedpi (нужен sudo)
 #   ./install.sh uninstall  — удалить (конфиг в ~/.config/byedpi-tg остаётся)
 set -eu
 
@@ -17,6 +18,48 @@ ZAPRET_TAG=v72.13
 ZAPRET_COMMIT=87e058624c72863db53bdaf7fb6f16576dddb6ab
 VOICE_LIB=/usr/local/lib/byedpi-tg
 VOICE_BIN=/usr/local/sbin/byedpi-tg-voice
+HEV_TAG=2.9.3
+HEV_COMMIT=b9b9b7b9b0febe32bb5d8cdb9ffa414d94242b75
+TUN_BIN=/usr/local/sbin/byedpi-tg-tun
+TUN_USER=_byedpi
+
+install_tun_ciadpi() {  # копия ciadpi для TUN принадлежит root: её запускает хелпер
+    sudo install -o root -g root -m 755 "$APP/byedpi/ciadpi" "$VOICE_LIB/ciadpi"
+}
+
+if [ "${1:-}" = "tun" ]; then
+    [ -x "$APP/byedpi/ciadpi" ] || { echo "Сначала выполни ./install.sh без аргументов." >&2; exit 1; }
+    if command -v xbps-install >/dev/null 2>&1; then
+        say "Ставлю зависимости через xbps (нужен sudo)"
+        sudo xbps-install -Sy git gcc make iproute2 util-linux iptables shadow
+    else
+        echo "Нужны: git, gcc, make, iproute2, util-linux (setpriv), iptables, useradd." >&2
+    fi
+    for c in ip setpriv; do command -v "$c" >/dev/null || { echo "Нужен $c." >&2; exit 1; }; done
+    BUILD="$(mktemp -d)"
+    trap 'rm -rf "$BUILD"' EXIT
+    say "Собираю hev-socks5-tunnel $HEV_TAG"
+    git clone --depth 1 --branch "$HEV_TAG" --recurse-submodules --shallow-submodules -q \
+        https://github.com/heiher/hev-socks5-tunnel "$BUILD/hev" 2>/dev/null
+    got="$(git -C "$BUILD/hev" rev-parse HEAD)"
+    if [ "$got" != "$HEV_COMMIT" ]; then
+        echo "Метка $HEV_TAG указывает на другой коммит: $got. Останавливаюсь." >&2
+        exit 1
+    fi
+    make -C "$BUILD/hev" -s >/dev/null 2>&1 || make -C "$BUILD/hev"
+    test -x "$BUILD/hev/bin/hev-socks5-tunnel"
+    say "Ставлю хелпер, hev-socks5-tunnel и копию ciadpi в /usr/local (нужен sudo)"
+    [ ! -x "$TUN_BIN" ] || sudo "$TUN_BIN" stop >/dev/null
+    if ! id "$TUN_USER" >/dev/null 2>&1; then
+        sudo useradd -r -U -M -d /var/empty -s /bin/false -c "byedpi-tg TUN" "$TUN_USER"
+    fi
+    sudo install -d -o root -g root -m 755 "$VOICE_LIB"
+    sudo install -o root -g root -m 755 "$BUILD/hev/bin/hev-socks5-tunnel" "$VOICE_LIB/hev-socks5-tunnel"
+    install_tun_ciadpi
+    sudo install -o root -g root -m 755 "$SRC/tun/byedpi-tg-tun" "$TUN_BIN"
+    say "Готово. Включай карточкой «Все приложения · TUN» или: byedpi-tg-diag --tun start"
+    exit 0
+fi
 
 if [ "${1:-}" = "voice" ]; then
     if command -v xbps-install >/dev/null 2>&1; then
@@ -51,8 +94,15 @@ if [ "${1:-}" = "uninstall" ]; then
     if [ -e "$VOICE_BIN" ]; then
         say "Убираю режим голоса (нужен sudo)"
         sudo "$VOICE_BIN" stop >/dev/null || true
-        sudo rm -rf "$VOICE_LIB" "$VOICE_BIN"
+        sudo rm -f "$VOICE_BIN"
     fi
+    if [ -e "$TUN_BIN" ]; then
+        say "Убираю режим TUN (нужен sudo)"
+        sudo "$TUN_BIN" stop >/dev/null || true
+        sudo rm -f "$TUN_BIN"
+        ! id "$TUN_USER" >/dev/null 2>&1 || sudo userdel "$TUN_USER" || true
+    fi
+    [ ! -d "$VOICE_LIB" ] || sudo rm -rf "$VOICE_LIB"
     rm -rf "$APP" "$BIN/byedpi-tg" "$BIN/byedpi-tg-diag" "$DESKTOP/byedpi-tg.desktop"
     say "Удалено. Конфиг оставлен в ~/.config/byedpi-tg"
     exit 0
@@ -89,6 +139,11 @@ say "Собираю byedpi"
 clone_or_pull https://github.com/hufrea/byedpi "$APP/byedpi"
 make -C "$APP/byedpi" -s >/dev/null 2>&1 || make -C "$APP/byedpi"
 test -x "$APP/byedpi/ciadpi"
+if [ -x "$TUN_BIN" ]; then
+    say "Обновляю копию ciadpi и хелпер режима TUN (нужен sudo)"
+    install_tun_ciadpi
+    sudo install -o root -g root -m 755 "$SRC/tun/byedpi-tg-tun" "$TUN_BIN"
+fi
 
 # 3. tg-ws-proxy
 say "Качаю tg-ws-proxy"

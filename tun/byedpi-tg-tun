@@ -1,0 +1,249 @@
+#!/bin/sh
+# Режим TUN: весь исходящий TCP системы идёт через byedpi, настраивать прокси в приложениях не нужно.
+#
+#   byedpi-tg-tun start <порт> [--allow-quic] -- <аргументы ciadpi>
+#   byedpi-tg-tun stop
+#   byedpi-tg-tun status
+#
+# Как устроено:
+#   ciadpi слушает 127.0.0.1:<порт> под отдельным пользователем _byedpi;
+#   hev-socks5-tunnel поднимает интерфейс byedpi0 и отдаёт в ciadpi всё, что туда пришло;
+#   правила маршрутизации (ip rule) отправляют в byedpi0 только TCP. Трафик самого ciadpi
+#   (по uid), локальная сеть, адреса с отдельными маршрутами и Telegram идут мимо туннеля.
+#   UDP (DNS, голос) не трогается. QUIC (UDP/443) по умолчанию отклоняется, чтобы браузер
+#   сразу ушёл на TCP, который обрабатывает byedpi.
+#
+# Запускается от root. Ничего не переживает перезагрузку: автозапуска нет.
+set -u
+umask 022
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+LIB=/usr/local/lib/byedpi-tg
+CIADPI=$LIB/ciadpi
+HEV=$LIB/hev-socks5-tunnel
+RUN=/run/byedpi-tg-tun
+STATE=/run/byedpi-tg-tun.state
+RUNUSER=_byedpi
+DEV=byedpi0
+TABLE=2047
+PREF_UID=2040     # трафик самого ciadpi — мимо туннеля
+PREF_MAIN=2041    # всё, у чего есть конкретный маршрут (LAN, сервер VPN), — мимо туннеля
+PREF_SKIP=2042    # Telegram уже работает через tg-ws-proxy — мимо туннеля
+PREF_TCP=2043     # остальной TCP — в туннель
+CHAIN=BYEDPI_TUN
+# Сети Telegram (AS62041, AS59930, AS62014, AS211157, AS44907)
+TG_NETS4="91.105.192.0/23 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 95.161.64.0/20 149.154.160.0/20 185.76.151.0/24"
+TG_NETS6="2001:67c:4e8::/48 2001:b28:f23c::/47 2001:b28:f23f::/48 2a0a:f280::/32"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+comm_of() { cat "/proc/$1/comm" 2>/dev/null; }
+
+state_get() {  # $1 = ключ
+    [ -r "$STATE" ] || return 1
+    sed -n "s/^$1=//p" "$STATE" | head -n1
+}
+
+alive() {  # $1 = pid, $2 = ожидаемое имя процесса (comm обрезается до 15 символов)
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(comm_of "$1")" = "$2" ]
+}
+
+listening() {  # $1 = порт; ищем сокет в состоянии LISTEN на 127.0.0.1
+    hex=$(printf '%04X' "$1")
+    awk -v p="0100007F:$hex" '$2 == p && $4 == "0A" { f = 1 } END { exit !f }' /proc/net/tcp
+}
+
+has_ipv6() {
+    [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] || return 1
+    [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 0 ] || return 1
+    [ -n "$(ip -6 route show default 2>/dev/null)" ]
+}
+
+valid_args() {  # аргументы ciadpi: только печатные символы и без опций, ломающих режим
+    for a; do
+        case "$a" in
+            *[![:print:]]*) die "Недопустимый символ в аргументах ciadpi." ;;
+        esac
+        case "$a" in
+            -i*|-p*|-D|-w*|-y*|-P*|-E|-h|-v|--ip*|--port*|--daemon|--pidfile*|--cache-file*|\
+            --protect-path*|--transparent|--help|--version)
+                die "Опция $a задаётся самим режимом TUN, убери её из стратегии." ;;
+        esac
+    done
+}
+
+kill_pid() {  # $1 = pid, $2 = имя
+    alive "$1" "$2" || return 0
+    kill "$1" 2>/dev/null
+    i=0
+    while alive "$1" "$2" && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    alive "$1" "$2" && kill -9 "$1" 2>/dev/null
+    return 0
+}
+
+del_rules() {  # $1 = -4 или -6
+    for pref in $PREF_UID $PREF_MAIN $PREF_SKIP $PREF_TCP; do
+        n=0
+        while ip "$1" rule del pref "$pref" 2>/dev/null && [ "$n" -lt 64 ]; do n=$((n + 1)); done
+    done
+    ip "$1" route flush table "$TABLE" 2>/dev/null
+    return 0
+}
+
+del_quic_block() {  # $1 = iptables или ip6tables
+    command -v "$1" >/dev/null 2>&1 || return 0
+    while "$1" -w 5 -D OUTPUT -j "$CHAIN" 2>/dev/null; do :; done
+    "$1" -w 5 -F "$CHAIN" 2>/dev/null
+    "$1" -w 5 -X "$CHAIN" 2>/dev/null
+    return 0
+}
+
+stop_all() {
+    del_rules -4
+    del_rules -6
+    del_quic_block iptables
+    del_quic_block ip6tables
+    kill_pid "$(state_get hev_pid)" hev-socks5-tunn
+    kill_pid "$(state_get ciadpi_pid)" ciadpi
+    # hev удаляет интерфейс при выходе; если он остался от упавшего процесса, убираем сами
+    ip link show "$DEV" >/dev/null 2>&1 && ip link del "$DEV" 2>/dev/null
+    rm -f "$STATE"
+    rm -rf "$RUN"
+    return 0
+}
+
+add_rules() {  # $1 = -4 или -6, $2 = uid, $3 = сети Telegram
+    ip "$1" route add default dev "$DEV" table "$TABLE" || return 1
+    ip "$1" rule add pref "$PREF_UID" uidrange "$2-$2" lookup main || return 1
+    ip "$1" rule add pref "$PREF_MAIN" lookup main suppress_prefixlength 0 || return 1
+    for net in $3; do
+        ip "$1" rule add pref "$PREF_SKIP" to "$net" lookup main || return 1
+    done
+    ip "$1" rule add pref "$PREF_TCP" ipproto tcp lookup "$TABLE" || return 1
+}
+
+add_quic_block() {  # $1 = iptables или ip6tables, $2 = REJECT-тип
+    "$1" -w 5 -N "$CHAIN" || return 1
+    "$1" -w 5 -A "$CHAIN" -o lo -j RETURN || return 1
+    "$1" -w 5 -A "$CHAIN" -p udp --dport 443 -j REJECT --reject-with "$2" || return 1
+    "$1" -w 5 -I OUTPUT -j "$CHAIN" || return 1
+}
+
+write_hev_conf() {  # $1 = порт, $2 = 1, если нужен IPv6
+    {
+        printf 'tunnel:\n  name: %s\n  mtu: 8500\n  multi-queue: false\n  ipv4: 198.18.0.1\n' "$DEV"
+        [ "$2" = 1 ] && printf "  ipv6: 'fc00::1'\n"
+        printf "socks5:\n  port: %s\n  address: 127.0.0.1\n  udp: 'udp'\n" "$1"
+        printf "misc:\n  log-file: stderr\n  log-level: warn\n  limit-nofile: 65535\n"
+    } > "$RUN/hev.yml"
+}
+
+start() {
+    port=${1:-}
+    shift || true
+    case "$port" in ''|*[!0-9]*) die "Неверный порт: $port" ;; esac
+    [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || die "Порт должен быть от 1024 до 65535."
+    quic=block
+    if [ "${1:-}" = --allow-quic ]; then quic=allow; shift; fi
+    [ "${1:-}" = -- ] || die "Использование: byedpi-tg-tun start <порт> [--allow-quic] -- <аргументы ciadpi>"
+    shift
+    valid_args "$@"
+
+    [ -x "$CIADPI" ] || die "Нет $CIADPI. Установи режим: ./install.sh tun"
+    [ -x "$HEV" ] || die "Нет $HEV. Установи режим: ./install.sh tun"
+    command -v setpriv >/dev/null || die "Нужен setpriv (пакет util-linux)."
+    command -v ip >/dev/null || die "Нужен ip (пакет iproute2)."
+    uid=$(id -u "$RUNUSER" 2>/dev/null) || die "Нет пользователя $RUNUSER. Установи режим: ./install.sh tun"
+    gid=$(id -g "$RUNUSER")
+    [ "$uid" != 0 ] || die "Пользователь $RUNUSER не должен быть root."
+
+    stop_all
+    listening "$port" && die "Порт $port уже занят. Останови byedpi в приложении или выбери другой порт."
+    modprobe -q tun 2>/dev/null
+    [ -c /dev/net/tun ] || die "Нет /dev/net/tun: ядро без поддержки TUN."
+    mkdir -m 700 "$RUN" || die "Не удалось создать $RUN"
+    v6=0
+    has_ipv6 && v6=1
+
+    # 1. ciadpi без root и без возможности получить его обратно
+    setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
+        --inh-caps=-all --bounding-set=-all -- \
+        "$CIADPI" -i 127.0.0.1 -p "$port" "$@" </dev/null >"$RUN/ciadpi.log" 2>&1 &
+    cpid=$!
+    i=0
+    while ! listening "$port" && alive "$cpid" ciadpi && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    if ! alive "$cpid" ciadpi || ! listening "$port"; then
+        err=$(tail -n 5 "$RUN/ciadpi.log" 2>/dev/null)
+        kill "$cpid" 2>/dev/null
+        rm -rf "$RUN"
+        die "ciadpi не запустился с этими аргументами. ${err}"
+    fi
+    printf 'ciadpi_pid=%s\nport=%s\nuid=%s\n' "$cpid" "$port" "$uid" > "$STATE"
+
+    # 2. туннель
+    write_hev_conf "$port" "$v6"
+    "$HEV" "$RUN/hev.yml" </dev/null >"$RUN/hev.log" 2>&1 &
+    hpid=$!
+    printf 'hev_pid=%s\n' "$hpid" >> "$STATE"
+    i=0
+    while ! ip link show "$DEV" 2>/dev/null | grep -q '[<,]UP[,>]' && alive "$hpid" hev-socks5-tunn \
+          && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    if ! alive "$hpid" hev-socks5-tunn || ! ip link show "$DEV" >/dev/null 2>&1; then
+        err=$(tail -n 5 "$RUN/hev.log" 2>/dev/null)
+        stop_all
+        die "Туннель не поднялся. ${err}"
+    fi
+    # Ответы приходят из byedpi0, а обратный маршрут к их адресу — через основной выход:
+    # строгий rp_filter их бы отбросил. Режим 2 (нестрогий) действует только на этот интерфейс.
+    echo 2 > "/proc/sys/net/ipv4/conf/$DEV/rp_filter" 2>/dev/null
+
+    # 3. маршрутизация
+    if ! add_rules -4 "$uid" "$TG_NETS4"; then
+        stop_all
+        die "Не удалось добавить правила маршрутизации. Нужен iproute2 и ядро 4.17+ (ipproto в ip rule). Всё откатил."
+    fi
+    if [ "$v6" = 1 ] && ! add_rules -6 "$uid" "$TG_NETS6"; then
+        stop_all
+        die "Не удалось добавить правила маршрутизации IPv6. Всё откатил."
+    fi
+
+    # 4. QUIC: без него браузер сразу идёт по TCP через byedpi
+    if [ "$quic" = block ]; then
+        if command -v iptables >/dev/null 2>&1; then
+            if ! add_quic_block iptables icmp-port-unreachable; then
+                stop_all
+                die "Не удалось добавить правило iptables для QUIC. Всё откатил."
+            fi
+        else
+            quic=allow
+        fi
+        if [ "$v6" = 1 ] && command -v ip6tables >/dev/null 2>&1; then
+            add_quic_block ip6tables icmp6-port-unreachable || { del_quic_block ip6tables; }
+        fi
+    fi
+    printf 'dev=%s\nipv6=%s\nquic=%s\n' "$DEV" "$v6" "$quic" >> "$STATE"
+    printf 'Запущено: %s → ciadpi 127.0.0.1:%s, IPv6 %s, QUIC %s\n' "$DEV" "$port" \
+        "$([ "$v6" = 1 ] && echo да || echo нет)" "$([ "$quic" = block ] && echo отклоняется || echo пропускается)"
+}
+
+status() {
+    if alive "$(state_get ciadpi_pid)" ciadpi && alive "$(state_get hev_pid)" hev-socks5-tunn \
+       && ip -4 rule show pref "$PREF_TCP" 2>/dev/null | grep -q .; then
+        cat "$STATE"
+        ip -4 rule show | grep -E "^($PREF_UID|$PREF_MAIN|$PREF_SKIP|$PREF_TCP):" | head -n 6
+        return 0
+    fi
+    echo "Не запущено"
+    return 3
+}
+
+[ "$(id -u)" = 0 ] || die "Нужны права root."
+case "${1:-}" in
+    start) shift; start "$@" ;;
+    stop) stop_all; echo "Остановлено" ;;
+    status) status ;;
+    log) tail -n 50 "$RUN/ciadpi.log" "$RUN/hev.log" 2>/dev/null ;;
+    *) die "Использование: byedpi-tg-tun start <порт> [--allow-quic] -- <аргументы> | stop | status | log" ;;
+esac

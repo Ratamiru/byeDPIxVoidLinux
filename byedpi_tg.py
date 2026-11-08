@@ -171,7 +171,8 @@ class MainWindow(QMainWindow):
         self._workers: list[QThread] = []
         self._user_stopped: set[int] = set()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(620, 920)
+        self.setMinimumSize(620, 980)
+        self.tun_on = False
 
         self.p_dpi = QProcess(self)
         self.p_tg = QProcess(self)
@@ -199,6 +200,7 @@ class MainWindow(QMainWindow):
         self._vpn_timer.start(5000)
 
         root.addWidget(self._build_dpi_card())
+        root.addWidget(self._build_tun_card())
         root.addWidget(self._build_voice_card())
         root.addWidget(self._build_tg_card())
 
@@ -309,6 +311,24 @@ class MainWindow(QMainWindow):
             row2.addWidget(b)
         row2.addStretch()
         c.lay.addLayout(row2)
+        return c
+
+    def _build_tun_card(self) -> Card:
+        c = Card("Все приложения · TUN")
+        self.card_tun = c
+        self.tun_busy = False
+        c.toggle.toggled.connect(lambda on: self._tun_action("start" if on else "stop"))
+        hint = QLabel("Весь TCP системы идёт через byedpi: клиент Discord, лаунчеры, любые программы "
+                      "без настройки прокси. Стратегия и порт берутся из карточки «Сайты». "
+                      "Telegram, локальная сеть и UDP идут мимо.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        c.lay.addWidget(hint)
+        self.cb_quic = QCheckBox("Отклонять QUIC (UDP/443): браузер сразу пойдёт по TCP через byedpi")
+        self.cb_quic.setChecked(not self.cfg.get("tun_allow_quic", False))
+        self.cb_quic.toggled.connect(self._tun_quic_chosen)
+        c.lay.addWidget(self.cb_quic)
+        self._refresh_tun()
         return c
 
     def _build_voice_card(self) -> Card:
@@ -486,6 +506,87 @@ class MainWindow(QMainWindow):
         self.vpn_label.setVisible(is_vpn)
         if hasattr(self, "card_voice"):
             self._refresh_voice()
+        if hasattr(self, "card_tun"):
+            self._refresh_tun()
+
+    def _refresh_tun(self):
+        if self.tun_busy:
+            return
+        c = self.card_tun
+        if not core.TUN_HELPER.exists():
+            c.set_state("off", "Не установлен: ./install.sh tun")
+            c.toggle.setEnabled(False)
+            self.cb_quic.setEnabled(False)
+            return
+        c.toggle.setEnabled(True)
+        self.cb_quic.setEnabled(True)
+        st = core.tun_status()
+        was_on, self.tun_on = self.tun_on, st.running
+        if st.running:
+            c.set_state("on", f"Работает · {st.dev} → 127.0.0.1:{st.port}"
+                              + (" · VPN: не действует" if self.vpn_dev else ""))
+            c.status.setToolTip("QUIC " + ("отклоняется" if st.quic == "block" else "пропускается")
+                                + (", IPv6 тоже через туннель" if st.ipv6 else "")
+                                + (f"\nТрафик сейчас идёт через {self.vpn_dev}, туннель на него не влияет."
+                                   if self.vpn_dev else ""))
+            if self.p_dpi.state() == QProcess.NotRunning:
+                self.card_dpi.set_state("on", f"Работает в режиме TUN · 127.0.0.1:{st.port}")
+        else:
+            c.set_state("off")
+            if was_on and self.p_dpi.state() == QProcess.NotRunning:
+                self.card_dpi.set_state("off")
+        self.card_dpi.toggle.setEnabled(not st.running)
+        if hasattr(self, "tray"):
+            self._refresh_tray()
+
+    def _tun_quic_chosen(self, block: bool):
+        self.cfg["tun_allow_quic"] = not block
+        save_cfg(self.cfg)
+        if core.tun_status().running:
+            self._tun_action("start")
+
+    def _tun_action(self, action: str, password: str | None = None):
+        port, args = None, None
+        if action == "start":
+            if self.tester and self.tester.isRunning():
+                self.card_tun.set_state("off", "Сначала дождись конца подбора")
+                return
+            self._save()
+            try:
+                args = core.tun_argv(self.dpi_args.text(), self.fake_sni.text().strip(),
+                                     bool(self.cfg.get("ipv4_only", True)))
+            except ValueError as e:
+                self.card_tun.set_state("err", f"Аргументы: {e}")
+                return
+            port = self.dpi_port.value()
+            # ciadpi режима TUN займёт тот же порт: браузер и Discord, настроенные на SOCKS, продолжат работать
+            self._dpi_before_tun = self.p_dpi.state() != QProcess.NotRunning
+            self.stop_dpi()
+        allow_quic = bool(self.cfg.get("tun_allow_quic", False))
+        self.tun_busy = True
+        self.card_tun.set_state("wait", "Запуск…" if action == "start" else "Остановка…")
+        self.card_tun.toggle.setEnabled(False)
+        self._bg(lambda: core.tun_run(action, port, args, allow_quic, password),
+                 lambda res, a=action: self._tun_done(a, res))
+
+    def _tun_done(self, action: str, res):
+        code, text = res if isinstance(res, tuple) else (1, str(res))
+        self.tun_busy = False
+        self.card_tun.toggle.setEnabled(True)
+        if code == core.NEED_PASSWORD:
+            pw, ok = QInputDialog.getText(self, "Режим TUN",
+                                          "Пароль sudo. Нужен, чтобы поднять туннель и правила маршрутизации:",
+                                          QLineEdit.Password)
+            if ok and pw:
+                self._tun_action(action, pw)
+                return
+        elif code != 0:
+            QMessageBox.warning(self, "Режим TUN", text or "Хелпер завершился с ошибкой.")
+        elif text:
+            self._log("dpi", text)
+        self._refresh_tun()
+        if action == "start" and not self.tun_on and getattr(self, "_dpi_before_tun", False):
+            self.start_dpi()      # туннель не поднялся — возвращаем обычный SOCKS
 
     def _refresh_voice(self):
         if self.voice_busy:
@@ -496,6 +597,8 @@ class MainWindow(QMainWindow):
             c.toggle.setEnabled(False)
             self.voice_profile.setEnabled(False)
             return
+        c.toggle.setEnabled(True)
+        self.voice_profile.setEnabled(True)
         st = core.voice_status()
         if not st.running:
             c.set_state("off")
@@ -596,7 +699,7 @@ class MainWindow(QMainWindow):
         w.start()
 
     def _refresh_tray(self):
-        on_d = self.p_dpi.state() != QProcess.NotRunning
+        on_d = self.p_dpi.state() != QProcess.NotRunning or self.tun_on
         on_t = self.p_tg.state() != QProcess.NotRunning
         if self.tray:
             self.tray.setIcon(tray_icon(on_d, on_t))
@@ -613,6 +716,10 @@ class MainWindow(QMainWindow):
 
     def start_dpi(self):
         if self.p_dpi.state() != QProcess.NotRunning:
+            return
+        if self.tun_on:
+            self.statusBar().showMessage("Работает режим TUN: byedpi уже слушает порт SOCKS", 4000)
+            self._refresh_tray()
             return
         self._save()
         port = self.dpi_port.value()
@@ -767,7 +874,7 @@ class MainWindow(QMainWindow):
             "Если сменишь порт SOCKS5, нажми эту кнопку ещё раз.")
 
     def check_now(self):
-        if self.p_dpi.state() == QProcess.NotRunning:
+        if self.p_dpi.state() == QProcess.NotRunning and not self.tun_on:
             self.statusBar().showMessage("Сначала запусти byedpi", 3000)
             return
         self.btn_check.setEnabled(False)
@@ -827,6 +934,11 @@ class MainWindow(QMainWindow):
             return
         if not shutil.which("curl"):
             QMessageBox.warning(self, APP_NAME, "Нужен curl: sudo xbps-install curl")
+            return
+        if core.tun_status().running:
+            QMessageBox.warning(self, APP_NAME,
+                                "Работает режим TUN. Временные ciadpi подбора сами пойдут через туннель, "
+                                "и результат будет неверным. Останови TUN на время подбора.")
             return
         self._refresh_vpn()
         if self.vpn_dev:

@@ -68,6 +68,7 @@ DEFAULT_CFG = {
     "browser_cmd": "",           # пусто — найти браузер автоматически
     "discord_cmd": "",           # пусто — найти клиент Discord автоматически
     "voice_profile": "quic6",    # профиль nfqws для голоса Discord
+    "tun_allow_quic": False,     # TUN: не отклонять QUIC (UDP/443); браузер тогда идёт мимо byedpi
     "probe_timeout": 8,
     "probe_fingerprint": "firefox",
     "custom_targets": [],        # [{"service": "discord", "url": "https://…", "min_bytes": 0}]
@@ -808,19 +809,18 @@ def voice_status(state_file: Path = VOICE_STATE, proc: Path = Path("/proc")) -> 
     return VoiceStatus(True, state.get("iface", ""), state.get("profile", ""))
 
 
-def voice_run(action: str, profile: str | None = None, password: str | None = None) -> tuple[int, str]:
+def _sudo_helper(argv: list[str], password: str | None = None) -> tuple[int, str]:
     """
-    Запускает хелпер через sudo. Без пароля пробует sudo -n и возвращает VOICE_NEED_PASSWORD,
+    Запускает root-хелпер через sudo. Без пароля пробует sudo -n и возвращает VOICE_NEED_PASSWORD,
     если пароль нужен. Пароль передаётся только в stdin sudo и нигде не сохраняется.
     """
     sudo = ["sudo", "-n"] if password is None else ["sudo", "-S", "-k", "-p", ""]
-    args = [str(VOICE_HELPER), action] + ([profile] if profile else [])
     try:
-        r = subprocess.run(sudo + args, capture_output=True, text=True, timeout=30,
+        r = subprocess.run(sudo + argv, capture_output=True, text=True, timeout=30,
                            input="" if password is None else password + "\n",
                            env={**os.environ, "LC_ALL": "C"})
     except FileNotFoundError:
-        return 1, f"Нет sudo. Запусти от root: {' '.join(args)}"
+        return 1, f"Нет sudo. Запусти от root: {shlex.join(argv)}"
     except subprocess.TimeoutExpired:
         return 1, "Хелпер не ответил за 30 секунд."
     text = (r.stderr.strip() or r.stdout.strip())
@@ -829,6 +829,59 @@ def voice_run(action: str, profile: str | None = None, password: str | None = No
     if r.returncode != 0 and ("incorrect password" in r.stderr or "try again" in r.stderr):
         return 1, "Неверный пароль."
     return r.returncode, text
+
+
+def voice_run(action: str, profile: str | None = None, password: str | None = None) -> tuple[int, str]:
+    return _sudo_helper([str(VOICE_HELPER), action] + ([profile] if profile else []), password)
+
+
+# ─────────────────────────── режим TUN (весь TCP через byedpi) ───────────────────────────
+
+TUN_HELPER = Path("/usr/local/sbin/byedpi-tg-tun")
+TUN_STATE = Path("/run/byedpi-tg-tun.state")
+NEED_PASSWORD = VOICE_NEED_PASSWORD
+
+
+@dataclass(frozen=True)
+class TunStatus:
+    running: bool
+    port: int = 0
+    dev: str = ""
+    quic: str = ""
+    ipv6: bool = False
+
+
+def tun_status(state_file: Path = TUN_STATE, proc: Path = Path("/proc")) -> TunStatus:
+    """Работает ли TUN. Прав root не нужно: хелпер оставляет файл состояния в /run."""
+    try:
+        state = dict(line.split("=", 1) for line in state_file.read_text().split())
+        if (proc / state["ciadpi_pid"] / "comm").read_text().strip() != "ciadpi":
+            return TunStatus(False)
+        if (proc / state["hev_pid"] / "comm").read_text().strip() != "hev-socks5-tunn":
+            return TunStatus(False)
+        return TunStatus(True, int(state["port"]), state.get("dev", ""), state.get("quic", ""),
+                         state.get("ipv6") == "1")
+    except (OSError, ValueError, KeyError):
+        return TunStatus(False)
+
+
+def tun_argv(args: str, sni: str, ipv4_only: bool = True) -> list[str]:
+    """
+    Аргументы ciadpi для TUN: те же, что у SOCKS, но адрес и порт задаёт сам хелпер.
+    Без -X: из туннеля приходят только IP-адреса, имена ciadpi не разрешает, а с -X он
+    отклоняет все запросы на IPv6, и IPv6-соединения через туннель перестали бы работать.
+    ipv4_only оставлен для единообразия вызова.
+    """
+    tokens = [t for t in expand_args(args, sni) if t not in ("-X", "--no-ipv6")]
+    return [*runtime_flags(tokens, ipv4_only=False), *tokens]
+
+
+def tun_run(action: str, port: int | None = None, ciadpi_args: list[str] | None = None,
+            allow_quic: bool = False, password: str | None = None) -> tuple[int, str]:
+    argv = [str(TUN_HELPER), action]
+    if action == "start":
+        argv += [str(port), *(["--allow-quic"] if allow_quic else []), "--", *(ciadpi_args or [])]
+    return _sudo_helper(argv, password)
 
 
 VPN_WARNING = ("Трафик сейчас идёт через VPN ({dev}). Проверки показывают работу VPN, а не обхода DPI: "
@@ -867,6 +920,13 @@ def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
         out(f"Голос Discord: nfqws работает, {voice.iface}, профиль {voice.profile}")
     else:
         out(f"Голос Discord: {'выключен' if VOICE_HELPER.exists() else 'не установлен'}")
+
+    tun = tun_status()
+    if tun.running:
+        out(f"TUN: работает, {tun.dev} → ciadpi 127.0.0.1:{tun.port}, QUIC {tun.quic}. "
+            "Проверка «напрямую» ниже идёт через туннель, а подбор стратегий неточен.")
+    else:
+        out(f"TUN: {'выключен' if TUN_HELPER.exists() else 'не установлен'}")
 
     out("\n== DNS ==")
     dns = check_dns()
@@ -937,7 +997,22 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="подбирать, даже если активен VPN")
     ap.add_argument("--voice", choices=("start", "stop", "status"), help="голос Discord через nfqws (спросит пароль sudo)")
     ap.add_argument("--voice-profile", choices=sorted(VOICE_PROFILES), help="профиль для --voice start")
+    ap.add_argument("--tun", choices=("start", "stop", "status", "log"),
+                    help="весь TCP через byedpi (спросит пароль sudo); стратегия и порт из конфига")
     a = ap.parse_args()
+    if a.tun:
+        if not TUN_HELPER.exists():
+            print("Режим не установлен. Выполни: ./install.sh tun", file=sys.stderr)
+            return 1
+        extra: list[str] = []
+        if a.tun == "start":
+            cfg = load_cfg()
+            if port_busy(cfg["byedpi_port"]):
+                print(f"Порт {cfg['byedpi_port']} занят: останови byedpi в приложении.", file=sys.stderr)
+                return 1
+            extra = [str(cfg["byedpi_port"]), *(["--allow-quic"] if cfg.get("tun_allow_quic") else []),
+                     "--", *tun_argv(cfg["byedpi_args"], cfg["fake_sni"], bool(cfg.get("ipv4_only", True)))]
+        return subprocess.run(["sudo", str(TUN_HELPER), a.tun, *extra]).returncode
     if a.voice:
         if not VOICE_HELPER.exists():
             print("Режим не установлен. Выполни: ./install.sh voice", file=sys.stderr)
@@ -945,6 +1020,10 @@ def main() -> int:
         extra = [a.voice_profile or load_cfg()["voice_profile"]] if a.voice == "start" else []
         return subprocess.run(["sudo", str(VOICE_HELPER), a.voice, *extra]).returncode
     dev, is_vpn = route_info()
+    if a.pick and tun_status().running and not a.force:
+        print("Работает режим TUN: временные ciadpi подбора сами пойдут через туннель, и результат "
+              "будет неверным. Останови его: byedpi-tg-diag --tun stop", file=sys.stderr)
+        return 2
     if a.pick and is_vpn and not a.force:
         print(VPN_WARNING.format(dev=dev), file=sys.stderr)
         print("Подбор отменён. Запусти с --force, если всё равно нужно.", file=sys.stderr)

@@ -4,6 +4,7 @@ W=$1
 O=$W/out; mkdir -p "$O" "$W/lib"; chmod 777 "$O"; chmod 755 "$W/lib"
 PY=$(command -v python3)
 NOBODY=$(id -u nobody)
+APPGID=$(getent group daemon | cut -d: -f3)
 PASS=0; FAILS=0
 ok() { echo "ok   - $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL - $1${2:+: $2}"; FAILS=$((FAILS+1)); }
@@ -11,7 +12,7 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "ожидалось [$
 
 # Хелпер без изменений, кроме путей и пользователя
 sed -e "s|^LIB=.*|LIB=$W/lib|" -e "s|^RUN=.*|RUN=$W/run|" -e "s|^STATE=.*|STATE=$W/state|" \
-    -e "s|^RUNUSER=.*|RUNUSER=nobody|" "$W/byedpi-tg-tun" > "$W/helper"
+    -e "s|^RUNUSER=.*|RUNUSER=nobody|" -e "s|^APPGROUP=.*|APPGROUP=daemon|" "$W/byedpi-tg-tun" > "$W/helper"
 chmod 755 "$W/helper"
 H="$W/helper"
 
@@ -44,7 +45,8 @@ ip link set lo up
 $PY "$W/tunlog.py" wan0 "$O/wan.log" 10.9.0.1/24 & WANPID=$!
 i=0; while ! ip link show wan0 2>/dev/null | grep -q UP && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 ip route add default dev wan0
-snap() { ip -4 rule show; ip -4 route show table all | grep -v ' table local'; iptables -w -S; ip link show | grep -c byedpi0; }
+snap() { ip -4 rule show; ip -4 route show table all | grep -v ' table local'
+        for t in filter mangle nat; do iptables -w -t $t -S; done; ip link show | grep -c byedpi0; }
 base=$(snap)
 
 where() {  # куда ушёл SYN или датаграмма: tun, wan, оба или никуда
@@ -112,6 +114,31 @@ check "правило TCP одно" "$(ip -4 rule show pref 2043 | wc -l)" 1
 check "без блокировки QUIC" "$(where udp 203.0.113.5 443)" "wan sent"
 check "одна копия ciadpi" "$(pgrep -c -f 'lib/ciadpi')" 1
 
+# --- выбор приложений: только из списка
+$H start 1090 --scope=nosuch -- -d1 >/dev/null 2>&1; check "неизвестный режим выбора отклонён" $? 1
+$H start 1090 --scope=only -- -d1 >/dev/null 2>"$O/err"; rc=$?
+[ $rc = 0 ] || echo "# $(cat "$O/err")"; check "запуск: только приложения из списка" $rc 0
+check "only: состояние" "$(sed -n 's/^scope=//p' "$W/state")" only
+check "only: обычное приложение — мимо туннеля" "$(where tcp 203.0.113.5 80)" wan
+check "only: приложение из списка — в туннель" "$(where tcp 203.0.113.5 80 - $APPGID)" tun
+check "only: из списка, но Telegram — мимо" "$(where tcp 149.154.167.51 443 - $APPGID)" wan
+check "only: из списка, но локальная сеть — мимо" "$(where tcp 10.9.0.7 80 - $APPGID)" wan
+check "only: UDP из списка — мимо" "$(where udp 203.0.113.5 53 - $APPGID)" "wan sent"
+check "only: ciadpi — мимо" "$(where tcp 203.0.113.5 80 $NOBODY)" wan
+
+# --- выбор приложений: все, кроме списка
+$H start 1090 --scope=except -- -d1 >/dev/null 2>"$O/err"; rc=$?
+[ $rc = 0 ] || echo "# $(cat "$O/err")"; check "запуск: все, кроме списка" $rc 0
+check "except: обычное приложение — в туннель" "$(where tcp 203.0.113.5 80)" tun
+check "except: приложение из списка — мимо туннеля" "$(where tcp 203.0.113.5 80 - $APPGID)" wan
+check "except: у него адрес настоящего выхода, а не туннеля" \
+    "$(awk '$3 == "203.0.113.5" { print $2; exit }' "$O/wan.log")" 10.9.0.1
+check "except: правило MASQUERADE одно" "$(iptables -w -t nat -S BYEDPI_TUN_NAT | grep -c MASQUERADE)" 1
+$H start 1090 --scope=all -- -d1 >/dev/null 2>&1
+check "обратно на всех: метки убраны" "$(iptables -w -t mangle -S | grep -c BYEDPI_TUN_MARK)" 0
+check "обратно на всех: NAT убран" "$(iptables -w -t nat -S | grep -c BYEDPI_TUN_NAT)" 0
+check "all: приложение из списка — тоже в туннель" "$(where tcp 203.0.113.5 80 - $APPGID)" tun
+
 # --- занятый порт
 $H stop >/dev/null
 $PY -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",1090)); s.listen(); time.sleep(5)' & BUSY=$!
@@ -122,7 +149,7 @@ grep -q "занят" "$O/err" && ok "про занятый порт сказан
 kill $BUSY; wait $BUSY 2>/dev/null
 
 # --- остановка
-$H start 1090 -- -d1 >/dev/null 2>&1
+$H start 1090 --scope=except -- -d1 >/dev/null 2>&1
 $H stop >/dev/null; check "stop" $? 0
 check "после остановки всё как было" "$(snap)" "$base"
 check "процессы остановлены" "$(pgrep -c -f 'lib/ciadpi|lib/hev|tun.log')" 0

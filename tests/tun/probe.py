@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""probe.py tcp|udp IP PORT [uid] — шлёт один SYN или датаграмму; для UDP печатает refused/sent."""
+"""probe.py tcp|udp IP PORT [uid|-] [gid] — шлёт один SYN или датаграмму; для UDP печатает refused/sent."""
 import os
 import socket
 import sys
 import time
 
 kind, ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
-if len(sys.argv) > 4:
+if len(sys.argv) > 5:
+    os.setgroups([])
+    os.setgid(int(sys.argv[5]))
+if len(sys.argv) > 4 and sys.argv[4] != "-":
     os.setgid(int(sys.argv[4]))
     os.setuid(int(sys.argv[4]))
 if kind == "tcp":

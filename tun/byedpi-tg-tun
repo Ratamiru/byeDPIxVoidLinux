@@ -1,7 +1,7 @@
 #!/bin/sh
 # Режим TUN: весь исходящий TCP системы идёт через byedpi, настраивать прокси в приложениях не нужно.
 #
-#   byedpi-tg-tun start <порт> [--allow-quic] -- <аргументы ciadpi>
+#   byedpi-tg-tun start <порт> [--allow-quic] [--scope=all|only|except] -- <аргументы ciadpi>
 #   byedpi-tg-tun stop
 #   byedpi-tg-tun status
 #
@@ -12,6 +12,13 @@
 #   (по uid), локальная сеть, адреса с отдельными маршрутами и Telegram идут мимо туннеля.
 #   UDP (DNS, голос) не трогается. QUIC (UDP/443) по умолчанию отклоняется, чтобы браузер
 #   сразу ушёл на TCP, который обрабатывает byedpi.
+#
+# Выбор приложений (--scope): программы, запущенные в группе byedpi-apps (обёртка byedpi-tg-run),
+# получают метку на своих TCP-пакетах (iptables -m owner --gid-owner). Дальше по метке:
+#   all    — метка не используется, в туннель идёт весь TCP;
+#   only   — в туннель идут только помеченные приложения;
+#   except — в туннель идут все, кроме помеченных. Их пакеты уже получили адрес туннеля
+#            при первом выборе маршрута, поэтому на выходе адрес заменяется (MASQUERADE).
 #
 # Запускается от root. Ничего не переживает перезагрузку: автозапуска нет.
 set -u
@@ -32,6 +39,10 @@ PREF_MAIN=2041    # всё, у чего есть конкретный маршр
 PREF_SKIP=2042    # Telegram уже работает через tg-ws-proxy — мимо туннеля
 PREF_TCP=2043     # остальной TCP — в туннель
 CHAIN=BYEDPI_TUN
+APPGROUP=byedpi-apps
+MARK=0x20000000   # nfqws голосового режима использует 0x40000000, не пересекаемся
+TUN4=198.18.0.1
+TUN6=fc00::1
 # Сети Telegram (AS62041, AS59930, AS62014, AS211157, AS44907)
 TG_NETS4="91.105.192.0/23 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 95.161.64.0/20 149.154.160.0/20 185.76.151.0/24"
 TG_NETS6="2001:67c:4e8::/48 2001:b28:f23c::/47 2001:b28:f23f::/48 2a0a:f280::/32"
@@ -100,11 +111,23 @@ del_quic_block() {  # $1 = iptables или ip6tables
     return 0
 }
 
+del_chain() {  # $1 = iptables|ip6tables, $2 = таблица, $3 = хук, $4 = цепочка
+    command -v "$1" >/dev/null 2>&1 || return 0
+    while "$1" -w 5 -t "$2" -D "$3" -j "$4" 2>/dev/null; do :; done
+    "$1" -w 5 -t "$2" -F "$4" 2>/dev/null
+    "$1" -w 5 -t "$2" -X "$4" 2>/dev/null
+    return 0
+}
+
 stop_all() {
     del_rules -4
     del_rules -6
     del_quic_block iptables
     del_quic_block ip6tables
+    for t in iptables ip6tables; do
+        del_chain "$t" mangle OUTPUT BYEDPI_TUN_MARK
+        del_chain "$t" nat POSTROUTING BYEDPI_TUN_NAT
+    done
     kill_pid "$(state_get hev_pid)" hev-socks5-tunn
     kill_pid "$(state_get ciadpi_pid)" ciadpi
     # hev удаляет интерфейс при выходе; если он остался от упавшего процесса, убираем сами
@@ -114,14 +137,33 @@ stop_all() {
     return 0
 }
 
-add_rules() {  # $1 = -4 или -6, $2 = uid, $3 = сети Telegram
+add_rules() {  # $1 = -4 или -6, $2 = uid, $3 = сети Telegram, $4 = scope
     ip "$1" route add default dev "$DEV" table "$TABLE" || return 1
     ip "$1" rule add pref "$PREF_UID" uidrange "$2-$2" lookup main || return 1
     ip "$1" rule add pref "$PREF_MAIN" lookup main suppress_prefixlength 0 || return 1
     for net in $3; do
         ip "$1" rule add pref "$PREF_SKIP" to "$net" lookup main || return 1
     done
-    ip "$1" rule add pref "$PREF_TCP" ipproto tcp lookup "$TABLE" || return 1
+    case "$4" in
+        all) ip "$1" rule add pref "$PREF_TCP" ipproto tcp lookup "$TABLE" || return 1 ;;
+        only) ip "$1" rule add pref "$PREF_TCP" fwmark "$MARK/$MARK" ipproto tcp lookup "$TABLE" || return 1 ;;
+        except)
+            ip "$1" rule add pref "$PREF_SKIP" fwmark "$MARK/$MARK" lookup main || return 1
+            ip "$1" rule add pref "$PREF_TCP" ipproto tcp lookup "$TABLE" || return 1 ;;
+    esac
+}
+
+add_marking() {  # $1 = iptables|ip6tables, $2 = gid, $3 = scope, $4 = адрес туннеля
+    # Метка в mangle OUTPUT заставляет ядро заново выбрать маршрут для пакета
+    "$1" -w 5 -t mangle -N BYEDPI_TUN_MARK || return 1
+    "$1" -w 5 -t mangle -A BYEDPI_TUN_MARK -p tcp -m owner --gid-owner "$2" \
+        -j MARK --set-xmark "$MARK/$MARK" || return 1
+    "$1" -w 5 -t mangle -I OUTPUT -j BYEDPI_TUN_MARK || return 1
+    [ "$3" = except ] || return 0
+    "$1" -w 5 -t nat -N BYEDPI_TUN_NAT || return 1
+    "$1" -w 5 -t nat -A BYEDPI_TUN_NAT -s "$4" ! -o "$DEV" -m mark --mark "$MARK/$MARK" \
+        -j MASQUERADE || return 1
+    "$1" -w 5 -t nat -I POSTROUTING -j BYEDPI_TUN_NAT || return 1
 }
 
 add_quic_block() {  # $1 = iptables или ip6tables, $2 = REJECT-тип
@@ -133,8 +175,8 @@ add_quic_block() {  # $1 = iptables или ip6tables, $2 = REJECT-тип
 
 write_hev_conf() {  # $1 = порт, $2 = 1, если нужен IPv6
     {
-        printf 'tunnel:\n  name: %s\n  mtu: 8500\n  multi-queue: false\n  ipv4: 198.18.0.1\n' "$DEV"
-        [ "$2" = 1 ] && printf "  ipv6: 'fc00::1'\n"
+        printf 'tunnel:\n  name: %s\n  mtu: 8500\n  multi-queue: false\n  ipv4: %s\n' "$DEV" "$TUN4"
+        [ "$2" = 1 ] && printf "  ipv6: '%s'\n" "$TUN6"
         printf "socks5:\n  port: %s\n  address: 127.0.0.1\n  udp: 'udp'\n" "$1"
         printf "misc:\n  log-file: stderr\n  log-level: warn\n  limit-nofile: 65535\n"
     } > "$RUN/hev.yml"
@@ -146,8 +188,16 @@ start() {
     case "$port" in ''|*[!0-9]*) die "Неверный порт: $port" ;; esac
     [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || die "Порт должен быть от 1024 до 65535."
     quic=block
-    if [ "${1:-}" = --allow-quic ]; then quic=allow; shift; fi
-    [ "${1:-}" = -- ] || die "Использование: byedpi-tg-tun start <порт> [--allow-quic] -- <аргументы ciadpi>"
+    scope=all
+    while :; do
+        case "${1:-}" in
+            --allow-quic) quic=allow; shift ;;
+            --scope=all|--scope=only|--scope=except) scope=${1#--scope=}; shift ;;
+            --scope=*) die "Неизвестный режим выбора приложений: ${1#--scope=}" ;;
+            *) break ;;
+        esac
+    done
+    [ "${1:-}" = -- ] || die "Использование: byedpi-tg-tun start <порт> [--allow-quic] [--scope=all|only|except] -- <аргументы ciadpi>"
     shift
     valid_args "$@"
 
@@ -158,10 +208,16 @@ start() {
     uid=$(id -u "$RUNUSER" 2>/dev/null) || die "Нет пользователя $RUNUSER. Установи режим: ./install.sh tun"
     gid=$(id -g "$RUNUSER")
     [ "$uid" != 0 ] || die "Пользователь $RUNUSER не должен быть root."
+    appgid=""
+    if [ "$scope" != all ]; then
+        appgid=$(getent group "$APPGROUP" | cut -d: -f3)
+        [ -n "$appgid" ] || die "Нет группы $APPGROUP. Обнови режим: ./install.sh tun"
+        command -v iptables >/dev/null 2>&1 || die "Для выбора приложений нужен iptables."
+    fi
 
     stop_all
     listening "$port" && die "Порт $port уже занят. Останови byedpi в приложении или выбери другой порт."
-    modprobe -q tun 2>/dev/null
+    for m in tun xt_owner xt_mark iptable_mangle iptable_nat xt_MASQUERADE; do modprobe -q "$m" 2>/dev/null; done
     [ -c /dev/net/tun ] || die "Нет /dev/net/tun: ядро без поддержки TUN."
     mkdir -m 700 "$RUN" || die "Не удалось создать $RUN"
     v6=0
@@ -200,13 +256,23 @@ start() {
     echo 2 > "/proc/sys/net/ipv4/conf/$DEV/rp_filter" 2>/dev/null
 
     # 3. маршрутизация
-    if ! add_rules -4 "$uid" "$TG_NETS4"; then
+    if ! add_rules -4 "$uid" "$TG_NETS4" "$scope"; then
         stop_all
         die "Не удалось добавить правила маршрутизации. Нужен iproute2 и ядро 4.17+ (ipproto в ip rule). Всё откатил."
     fi
-    if [ "$v6" = 1 ] && ! add_rules -6 "$uid" "$TG_NETS6"; then
+    if [ "$v6" = 1 ] && ! add_rules -6 "$uid" "$TG_NETS6" "$scope"; then
         stop_all
         die "Не удалось добавить правила маршрутизации IPv6. Всё откатил."
+    fi
+    if [ "$scope" != all ]; then
+        if ! add_marking iptables "$appgid" "$scope" "$TUN4"; then
+            stop_all
+            die "Не удалось добавить правила iptables для выбора приложений (нужны xt_owner, xt_mark, MASQUERADE). Всё откатил."
+        fi
+        if [ "$v6" = 1 ] && ! { command -v ip6tables >/dev/null 2>&1 && add_marking ip6tables "$appgid" "$scope" "$TUN6"; }; then
+            stop_all
+            die "Не удалось добавить правила ip6tables для выбора приложений. Всё откатил."
+        fi
     fi
 
     # 4. QUIC: без него браузер сразу идёт по TCP через byedpi
@@ -223,8 +289,8 @@ start() {
             add_quic_block ip6tables icmp6-port-unreachable || { del_quic_block ip6tables; }
         fi
     fi
-    printf 'dev=%s\nipv6=%s\nquic=%s\n' "$DEV" "$v6" "$quic" >> "$STATE"
-    printf 'Запущено: %s → ciadpi 127.0.0.1:%s, IPv6 %s, QUIC %s\n' "$DEV" "$port" \
+    printf 'dev=%s\nipv6=%s\nquic=%s\nscope=%s\n' "$DEV" "$v6" "$quic" "$scope" >> "$STATE"
+    printf 'Запущено: %s → ciadpi 127.0.0.1:%s, приложения: %s, IPv6 %s, QUIC %s\n' "$DEV" "$port" "$scope" \
         "$([ "$v6" = 1 ] && echo да || echo нет)" "$([ "$quic" = block ] && echo отклоняется || echo пропускается)"
 }
 
@@ -245,5 +311,5 @@ case "${1:-}" in
     stop) stop_all; echo "Остановлено" ;;
     status) status ;;
     log) tail -n 50 "$RUN/ciadpi.log" "$RUN/hev.log" 2>/dev/null ;;
-    *) die "Использование: byedpi-tg-tun start <порт> [--allow-quic] -- <аргументы> | stop | status | log" ;;
+    *) die "Использование: byedpi-tg-tun start <порт> [--allow-quic] [--scope=all|only|except] -- <аргументы> | stop | status | log" ;;
 esac

@@ -22,7 +22,8 @@ from PySide6.QtCore import QProcess, QThread, Qt, Signal, QTimer
 from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QIcon,
                            QPainter, QPalette, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                               QComboBox, QFrame, QGridLayout, QHBoxLayout,
+                               QComboBox, QDialog, QDialogButtonBox, QFrame,
+                               QGridLayout, QHBoxLayout, QListWidget, QListWidgetItem,
                                QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
                                QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSpinBox, QSystemTrayIcon,
@@ -133,6 +134,50 @@ class StrategyTester(QThread):
         except (OSError, ValueError) as e:
             self.failed.emit(f"Не удалось запустить ciadpi: {e}")
         self.done.emit(rows, best, self._stop)
+
+
+class AppsDialog(QDialog):
+    """Галочки у приложений из меню: отмеченные запускаются через byedpi-tg-run."""
+
+    def __init__(self, parent, apps: list[core.DesktopApp]):
+        super().__init__(parent)
+        self.setWindowTitle("Приложения для TUN")
+        self.resize(460, 560)
+        lay = QVBoxLayout(self)
+        hint = QLabel("Отмеченные приложения будут запускаться из меню через byedpi-tg-run. "
+                      "Пойдут ли они в туннель или мимо него, решает режим в карточке TUN.\n"
+                      "Уже открытое приложение закрой полностью (включая трей) и запусти заново.")
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        lay.addWidget(hint)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Поиск…")
+        self.search.textChanged.connect(self._filter)
+        lay.addWidget(self.search)
+        self.list = QListWidget()
+        for app in apps:
+            it = QListWidgetItem(QIcon.fromTheme(app.icon) if app.icon else QIcon(), app.name)
+            it.setData(Qt.UserRole, app.id)
+            it.setToolTip(f"{app.id}\n{app.exec}")
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if app.wrapped else Qt.Unchecked)
+            self.list.addItem(it)
+        lay.addWidget(self.list, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _filter(self, text: str):
+        text = text.lower()
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            it.setHidden(bool(text) and text not in it.text().lower()
+                         and text not in it.data(Qt.UserRole).lower())
+
+    def checked(self) -> set[str]:
+        return {self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.Checked}
 
 
 class ScoreItem(QTableWidgetItem):
@@ -318,16 +363,32 @@ class MainWindow(QMainWindow):
         self.card_tun = c
         self.tun_busy = False
         c.toggle.toggled.connect(lambda on: self._tun_action("start" if on else "stop"))
-        hint = QLabel("Весь TCP системы идёт через byedpi: клиент Discord, лаунчеры, любые программы "
-                      "без настройки прокси. Стратегия и порт берутся из карточки «Сайты». "
-                      "Telegram, локальная сеть и UDP идут мимо.")
+        hint = QLabel("TCP приложений идёт через byedpi без настройки прокси: клиент Discord, лаунчеры, "
+                      "любые программы. Можно пустить все или выбрать по списку. Стратегия и порт берутся "
+                      "из карточки «Сайты». Telegram, локальная сеть и UDP идут мимо.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         c.lay.addWidget(hint)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Через туннель"))
+        self.tun_scope = QComboBox()
+        for key, title in core.TUN_SCOPES.items():
+            self.tun_scope.addItem(title, key)
+        self.tun_scope.setCurrentIndex(max(self.tun_scope.findData(self.cfg.get("tun_scope", "all")), 0))
+        self.tun_scope.setToolTip(
+            "Только из списка: в туннель идут только отмеченные приложения, остальные напрямую.\n"
+            "Все, кроме списка: отмеченные идут напрямую, остальные через туннель.")
+        self.tun_scope.activated.connect(self._tun_scope_chosen)
+        row.addWidget(self.tun_scope, 1)
+        self.btn_apps = QPushButton("Список приложений…")
+        self.btn_apps.clicked.connect(self.edit_tun_apps)
+        row.addWidget(self.btn_apps)
+        c.lay.addLayout(row)
         self.cb_quic = QCheckBox("Отклонять QUIC (UDP/443): браузер сразу пойдёт по TCP через byedpi")
         self.cb_quic.setChecked(not self.cfg.get("tun_allow_quic", False))
         self.cb_quic.toggled.connect(self._tun_quic_chosen)
         c.lay.addWidget(self.cb_quic)
+        self._update_apps_button()
         self._refresh_tun()
         return c
 
@@ -515,15 +576,16 @@ class MainWindow(QMainWindow):
         c = self.card_tun
         if not core.TUN_HELPER.exists():
             c.set_state("off", "Не установлен: ./install.sh tun")
-            c.toggle.setEnabled(False)
-            self.cb_quic.setEnabled(False)
+            for w in (c.toggle, self.cb_quic, self.tun_scope, self.btn_apps):
+                w.setEnabled(False)
             return
-        c.toggle.setEnabled(True)
-        self.cb_quic.setEnabled(True)
+        for w in (c.toggle, self.cb_quic, self.tun_scope, self.btn_apps):
+            w.setEnabled(True)
         st = core.tun_status()
         was_on, self.tun_on = self.tun_on, st.running
         if st.running:
-            c.set_state("on", f"Работает · {st.dev} → 127.0.0.1:{st.port}"
+            scope = {"only": " · только список", "except": " · кроме списка"}.get(st.scope, "")
+            c.set_state("on", f"Работает · {st.dev} → 127.0.0.1:{st.port}{scope}"
                               + (" · VPN: не действует" if self.vpn_dev else ""))
             c.status.setToolTip("QUIC " + ("отклоняется" if st.quic == "block" else "пропускается")
                                 + (", IPv6 тоже через туннель" if st.ipv6 else "")
@@ -538,6 +600,44 @@ class MainWindow(QMainWindow):
         self.card_dpi.toggle.setEnabled(not st.running)
         if hasattr(self, "tray"):
             self._refresh_tray()
+
+    def _tun_scope_chosen(self):
+        self.cfg["tun_scope"] = self.tun_scope.currentData()
+        save_cfg(self.cfg)
+        self._update_apps_button()
+        if core.tun_status().running:
+            self._tun_action("start")
+
+    def _update_apps_button(self):
+        n = len(core.wrapped_apps())
+        self.btn_apps.setText(f"Список приложений ({n})…" if n else "Список приложений…")
+
+    def edit_tun_apps(self):
+        if not core.in_apps_group():
+            QMessageBox.warning(self, "Приложения для TUN",
+                                f"Пользователь не в группе {core.APPS_GROUP}, поэтому отмеченные приложения "
+                                "запустятся без метки. Выполни ./install.sh tun и перезапусти это окно.")
+        dlg = AppsDialog(self, core.list_desktop_apps())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        want, have = dlg.checked(), set(core.wrapped_apps())
+        errors = []
+        for app_id in sorted(want - have):
+            try:
+                core.wrap_app(app_id)
+            except OSError as e:
+                errors.append(f"{app_id}: {e}")
+        for app_id in sorted(have - want):
+            try:
+                core.unwrap_app(app_id)
+            except OSError as e:
+                errors.append(f"{app_id}: {e}")
+        self._update_apps_button()
+        if errors:
+            QMessageBox.warning(self, "Приложения для TUN", "\n".join(errors))
+        elif want != have:
+            self.statusBar().showMessage(
+                "Список обновлён. Открытые приложения закрой полностью и запусти заново из меню.", 8000)
 
     def _tun_quic_chosen(self, block: bool):
         self.cfg["tun_allow_quic"] = not block
@@ -563,10 +663,11 @@ class MainWindow(QMainWindow):
             self._dpi_before_tun = self.p_dpi.state() != QProcess.NotRunning
             self.stop_dpi()
         allow_quic = bool(self.cfg.get("tun_allow_quic", False))
+        scope = self.cfg.get("tun_scope", "all")
         self.tun_busy = True
         self.card_tun.set_state("wait", "Запуск…" if action == "start" else "Остановка…")
         self.card_tun.toggle.setEnabled(False)
-        self._bg(lambda: core.tun_run(action, port, args, allow_quic, password),
+        self._bg(lambda: core.tun_run(action, port, args, allow_quic, password, scope),
                  lambda res, a=action: self._tun_done(a, res))
 
     def _tun_done(self, action: str, res):
@@ -935,10 +1036,11 @@ class MainWindow(QMainWindow):
         if not shutil.which("curl"):
             QMessageBox.warning(self, APP_NAME, "Нужен curl: sudo xbps-install curl")
             return
-        if core.tun_status().running:
+        if core.tun_blocks_picking(core.tun_status()):
             QMessageBox.warning(self, APP_NAME,
                                 "Работает режим TUN. Временные ciadpi подбора сами пойдут через туннель, "
-                                "и результат будет неверным. Останови TUN на время подбора.")
+                                "и результат будет неверным. Останови TUN на время подбора "
+                                "или переключи его на «Только из списка».")
             return
         self._refresh_vpn()
         if self.vpn_dev:

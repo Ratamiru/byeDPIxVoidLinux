@@ -22,6 +22,7 @@ HEV_TAG=2.9.3
 HEV_COMMIT=b9b9b7b9b0febe32bb5d8cdb9ffa414d94242b75
 TUN_BIN=/usr/local/sbin/byedpi-tg-tun
 TUN_USER=_byedpi
+APPS_GROUP=byedpi-apps
 
 install_tun_ciadpi() {  # копия ciadpi для TUN принадлежит root: её запускает хелпер
     sudo install -o root -g root -m 755 "$APP/byedpi/ciadpi" "$VOICE_LIB/ciadpi"
@@ -53,6 +54,11 @@ if [ "${1:-}" = "tun" ]; then
     if ! id "$TUN_USER" >/dev/null 2>&1; then
         sudo useradd -r -U -M -d /var/empty -s /bin/false -c "byedpi-tg TUN" "$TUN_USER"
     fi
+    # Группа приложений из списка: byedpi-tg-run запускает их через sg с этой группой
+    getent group "$APPS_GROUP" >/dev/null || sudo groupadd -r "$APPS_GROUP"
+    sudo usermod -aG "$APPS_GROUP" "$(id -un)"
+    mkdir -p "$BIN"
+    install -m 755 "$SRC/tun/byedpi-tg-run" "$BIN/byedpi-tg-run"
     sudo install -d -o root -g root -m 755 "$VOICE_LIB"
     sudo install -o root -g root -m 755 "$BUILD/hev/bin/hev-socks5-tunnel" "$VOICE_LIB/hev-socks5-tunnel"
     install_tun_ciadpi
@@ -101,9 +107,16 @@ if [ "${1:-}" = "uninstall" ]; then
         sudo "$TUN_BIN" stop >/dev/null || true
         sudo rm -f "$TUN_BIN"
         ! id "$TUN_USER" >/dev/null 2>&1 || sudo userdel "$TUN_USER" || true
+        ! getent group "$APPS_GROUP" >/dev/null || sudo groupdel "$APPS_GROUP" || true
     fi
+    # свои копии ярлыков из списка TUN: убираем, а замещённые ярлыки пользователя возвращаем
+    APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    BACKUP="${XDG_CONFIG_HOME:-$HOME/.config}/byedpi-tg/desktop-backup"
+    for f in $(grep -l '^X-ByeDPI-TG-Wrapped=true' "$APPS_DIR"/*.desktop 2>/dev/null); do
+        if [ -f "$BACKUP/$(basename "$f")" ]; then mv "$BACKUP/$(basename "$f")" "$f"; else rm -f "$f"; fi
+    done
     [ ! -d "$VOICE_LIB" ] || sudo rm -rf "$VOICE_LIB"
-    rm -rf "$APP" "$BIN/byedpi-tg" "$BIN/byedpi-tg-diag" "$DESKTOP/byedpi-tg.desktop"
+    rm -rf "$APP" "$BIN/byedpi-tg" "$BIN/byedpi-tg-diag" "$BIN/byedpi-tg-run" "$DESKTOP/byedpi-tg.desktop"
     say "Удалено. Конфиг оставлен в ~/.config/byedpi-tg"
     exit 0
 fi
@@ -170,6 +183,7 @@ cat > "$BIN/byedpi-tg-diag" <<EOF
 #!/bin/sh
 exec "$APP/venv/bin/python" "$APP/dpi_core.py" "\$@"
 EOF
+install -m 755 "$SRC/tun/byedpi-tg-run" "$BIN/byedpi-tg-run"
 chmod +x "$BIN/byedpi-tg" "$BIN/byedpi-tg-diag"
 
 sed "s|@BIN@|$BIN|" "$SRC/byedpi-tg.desktop" > "$DESKTOP/byedpi-tg.desktop"

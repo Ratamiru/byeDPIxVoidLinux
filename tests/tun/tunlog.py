@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Поднимает tun-интерфейс и пишет в лог каждый пришедший в него IPv4-пакет: «tcp 1.2.3.4 80»."""
+"""Поднимает tun-интерфейс и пишет в лог каждый пришедший в него IPv4-пакет: «tcp ОТКУДА КУДА ПОРТ»."""
 import fcntl
 import os
 import struct
@@ -21,4 +21,5 @@ with open(log, "a", buffering=1) as f:
         ihl = (p[0] & 15) * 4
         proto = {6: "tcp", 17: "udp"}.get(p[9], str(p[9]))
         dport = int.from_bytes(p[ihl + 2:ihl + 4], "big") if proto in ("tcp", "udp") else 0
-        f.write(f"{proto} {'.'.join(map(str, p[16:20]))} {dport}\n")
+        src, dst = ".".join(map(str, p[12:16])), ".".join(map(str, p[16:20]))
+        f.write(f"{proto} {src} {dst} {dport}\n")

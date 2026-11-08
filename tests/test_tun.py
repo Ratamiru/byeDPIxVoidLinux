@@ -67,16 +67,109 @@ class TunRunTest(unittest.TestCase):
         args = core.tun_argv("-d1 -H:{sni} -At -s1", "google.com", True)
         self.assertEqual(core.tun_run("start", 1080, args, True), (0, "Запущено"))
         self.assertTrue(self.log.read_text().startswith(
-            f"[-n][{core.TUN_HELPER}][start][1080][--allow-quic][--][-T"))
+            f"[-n][{core.TUN_HELPER}][start][1080][--allow-quic][--scope=all][--][-T"))
         self.assertTrue(self.log.read_text().endswith("[-d1][-H:google.com][-At][-s1]"))
 
     def test_no_ipv6_flag_in_tun(self):
         # с -X ciadpi отклоняет IPv6-адреса, а из туннеля приходят только адреса
         self.assertEqual(core.tun_argv("-X -d1", "g", True), ["-d1"])
 
+    def test_scope_passed_and_validated(self):
+        core.tun_run("start", 1080, ["-d1"], False, None, "only")
+        self.assertIn("[1080][--scope=only][--][-d1]", self.log.read_text())
+        core.tun_run("start", 1080, ["-d1"], False, None, "evil")
+        self.assertIn("[--scope=all]", self.log.read_text())
+
     def test_stop(self):
         core.tun_run("stop")
         self.assertEqual(self.log.read_text(), f"[-n][{core.TUN_HELPER}][stop]")
+
+
+class PickingTest(unittest.TestCase):
+    def test_picking_allowed_only_when_user_traffic_bypasses_tunnel(self):
+        self.assertFalse(core.tun_blocks_picking(core.TunStatus(False)))
+        self.assertTrue(core.tun_blocks_picking(core.TunStatus(True, scope="all")))
+        self.assertTrue(core.tun_blocks_picking(core.TunStatus(True, scope="except")))
+        self.assertFalse(core.tun_blocks_picking(core.TunStatus(True, scope="only")))
+
+
+DISCORD = """[Desktop Entry]
+Name=Discord
+Exec=/usr/bin/discord %U
+Icon=discord
+Type=Application
+DBusActivatable=true
+
+[Desktop Action new]
+Name=Новое окно
+Exec=/usr/bin/discord --new-window
+"""
+
+
+class DesktopAppsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        self.sys_apps = d / "usr/share/applications"
+        self.sys_apps.mkdir(parents=True)
+        (self.sys_apps / "discord.desktop").write_text(DISCORD)
+        (self.sys_apps / "hidden.desktop").write_text("[Desktop Entry]\nName=H\nExec=h\nType=Application\nNoDisplay=true\n")
+        (self.sys_apps / "org.mozilla.firefox.desktop").write_text("[Desktop Entry]\nName=Firefox\nExec=firefox %u\nType=Application\n")
+        self.local = d / "home/applications"
+        patches = [
+            mock.patch.dict(os.environ, {"XDG_DATA_DIRS": str(d / "usr/share")}),
+            mock.patch.object(core, "LOCAL_APPS", self.local),
+            mock.patch.object(core, "DATA_HOME", d / "home"),
+            mock.patch.object(core, "DESKTOP_BACKUP", d / "backup"),
+            mock.patch.object(core, "RUN_WRAPPER", Path("/home/u/.local/bin/byedpi-tg-run")),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def apps(self):
+        return {a.id: a for a in core.list_desktop_apps()}
+
+    def test_list_skips_hidden(self):
+        self.assertEqual(set(self.apps()), {"discord.desktop", "org.mozilla.firefox.desktop"})
+
+    def test_wrap_every_exec_and_drop_dbus(self):
+        core.wrap_app("discord.desktop")
+        text = (self.local / "discord.desktop").read_text()
+        self.assertIn("Exec=/home/u/.local/bin/byedpi-tg-run /usr/bin/discord %U", text)
+        self.assertIn("Exec=/home/u/.local/bin/byedpi-tg-run /usr/bin/discord --new-window", text)
+        self.assertNotIn("DBusActivatable", text)
+        self.assertEqual(text.count(core.WRAP_KEY), 1)
+        self.assertTrue(self.apps()["discord.desktop"].wrapped)
+        self.assertEqual(core.wrapped_apps(), ["discord.desktop"])
+        core.wrap_app("discord.desktop")       # повторно — без двойной обёртки
+        self.assertEqual((self.local / "discord.desktop").read_text().count("byedpi-tg-run"), 2)
+
+    def test_unwrap_restores_system_entry(self):
+        core.wrap_app("discord.desktop")
+        core.unwrap_app("discord.desktop")
+        self.assertFalse((self.local / "discord.desktop").exists())
+        self.assertFalse(self.apps()["discord.desktop"].wrapped)
+
+    def test_users_own_entry_is_kept(self):
+        self.local.mkdir(parents=True)
+        own = "[Desktop Entry]\nName=Мой Firefox\nExec=firefox -P work\nType=Application\n"
+        (self.local / "org.mozilla.firefox.desktop").write_text(own)
+        core.wrap_app("org.mozilla.firefox.desktop")
+        self.assertIn("byedpi-tg-run firefox -P work", (self.local / "org.mozilla.firefox.desktop").read_text())
+        core.unwrap_app("org.mozilla.firefox.desktop")
+        self.assertEqual((self.local / "org.mozilla.firefox.desktop").read_text(), own)
+
+    def test_unwrap_leaves_foreign_entry(self):
+        self.local.mkdir(parents=True)
+        (self.local / "x.desktop").write_text("[Desktop Entry]\nExec=x\n")
+        core.unwrap_app("x.desktop")
+        self.assertTrue((self.local / "x.desktop").exists())
+
+    def test_wrapper_path_with_space_is_quoted(self):
+        with mock.patch.object(core, "RUN_WRAPPER", Path('/home/a b/run')):
+            self.assertEqual(core._exec_prefix(), '"/home/a b/run" ')
 
 
 class TunHelperTest(unittest.TestCase):

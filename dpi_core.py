@@ -69,6 +69,7 @@ DEFAULT_CFG = {
     "discord_cmd": "",           # пусто — найти клиент Discord автоматически
     "voice_profile": "quic6",    # профиль nfqws для голоса Discord
     "tun_allow_quic": False,     # TUN: не отклонять QUIC (UDP/443); браузер тогда идёт мимо byedpi
+    "tun_scope": "all",          # TUN: all — все приложения, only — только из списка, except — все, кроме списка
     "probe_timeout": 8,
     "probe_fingerprint": "firefox",
     "custom_targets": [],        # [{"service": "discord", "url": "https://…", "min_bytes": 0}]
@@ -842,6 +843,13 @@ TUN_STATE = Path("/run/byedpi-tg-tun.state")
 NEED_PASSWORD = VOICE_NEED_PASSWORD
 
 
+TUN_SCOPES = {
+    "all": "Все приложения",
+    "only": "Только из списка",
+    "except": "Все, кроме списка",
+}
+
+
 @dataclass(frozen=True)
 class TunStatus:
     running: bool
@@ -849,6 +857,7 @@ class TunStatus:
     dev: str = ""
     quic: str = ""
     ipv6: bool = False
+    scope: str = "all"
 
 
 def tun_status(state_file: Path = TUN_STATE, proc: Path = Path("/proc")) -> TunStatus:
@@ -860,7 +869,7 @@ def tun_status(state_file: Path = TUN_STATE, proc: Path = Path("/proc")) -> TunS
         if (proc / state["hev_pid"] / "comm").read_text().strip() != "hev-socks5-tunn":
             return TunStatus(False)
         return TunStatus(True, int(state["port"]), state.get("dev", ""), state.get("quic", ""),
-                         state.get("ipv6") == "1")
+                         state.get("ipv6") == "1", state.get("scope", "all"))
     except (OSError, ValueError, KeyError):
         return TunStatus(False)
 
@@ -877,11 +886,171 @@ def tun_argv(args: str, sni: str, ipv4_only: bool = True) -> list[str]:
 
 
 def tun_run(action: str, port: int | None = None, ciadpi_args: list[str] | None = None,
-            allow_quic: bool = False, password: str | None = None) -> tuple[int, str]:
+            allow_quic: bool = False, password: str | None = None, scope: str = "all") -> tuple[int, str]:
     argv = [str(TUN_HELPER), action]
     if action == "start":
-        argv += [str(port), *(["--allow-quic"] if allow_quic else []), "--", *(ciadpi_args or [])]
+        if scope not in TUN_SCOPES:
+            scope = "all"
+        argv += [str(port), *(["--allow-quic"] if allow_quic else []), f"--scope={scope}",
+                 "--", *(ciadpi_args or [])]
     return _sudo_helper(argv, password)
+
+
+def tun_blocks_picking(st: TunStatus) -> bool:
+    """
+    Подбор запускает временные ciadpi от имени пользователя. В режиме «только из списка» они
+    в туннель не попадают, в остальных режимах ушли бы в него, и результат был бы неверным.
+    """
+    return st.running and st.scope != "only"
+
+
+# ─────────────────────────── список приложений для TUN ───────────────────────────
+#
+# Приложение «из списка» — то, что запущено в группе byedpi-apps через byedpi-tg-run.
+# Чтобы это работало и при запуске из меню, для выбранных приложений создаются свои копии
+# ярлыков в ~/.local/share/applications (они перекрывают системные) с Exec через обёртку.
+
+APPS_GROUP = "byedpi-apps"
+RUN_WRAPPER = Path.home() / ".local/bin/byedpi-tg-run"
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+LOCAL_APPS = DATA_HOME / "applications"
+DESKTOP_BACKUP = CFG_DIR / "desktop-backup"
+WRAP_KEY = "X-ByeDPI-TG-Wrapped"
+
+
+@dataclass(frozen=True)
+class DesktopApp:
+    id: str
+    name: str
+    exec: str
+    icon: str
+    wrapped: bool
+
+
+def _system_app_dirs() -> list[Path]:
+    dirs = [Path(d) / "applications"
+            for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    for extra in (DATA_HOME / "flatpak/exports/share/applications",
+                  Path("/var/lib/flatpak/exports/share/applications")):
+        if extra not in dirs:
+            dirs.append(extra)
+    return [d for d in dirs if d != LOCAL_APPS]
+
+
+def _desktop_files(base: Path):
+    """(id, путь): id — путь относительно applications/ с «/» → «-», как в спецификации."""
+    try:
+        for f in sorted(base.rglob("*.desktop")):
+            yield str(f.relative_to(base)).replace("/", "-"), f
+    except OSError:
+        return
+
+
+def _entry(text: str) -> dict[str, str]:
+    out, inside = {}, False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            inside = line == "[Desktop Entry]"
+        elif inside and "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def _is_wrapped(path: Path) -> bool:
+    try:
+        return f"{WRAP_KEY}=true" in path.read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def list_desktop_apps() -> list[DesktopApp]:
+    """Приложения из меню. Свои копии в ~/.local/share/applications главнее системных."""
+    seen: dict[str, DesktopApp] = {}
+    for base in [LOCAL_APPS, *_system_app_dirs()]:
+        for app_id, f in _desktop_files(base):
+            if app_id in seen or app_id == "byedpi-tg.desktop":
+                continue
+            try:
+                e = _entry(f.read_text(errors="replace"))
+            except OSError:
+                continue
+            seen[app_id] = None  # первый найденный перекрывает остальные, даже если он скрыт
+            if (e.get("Type") != "Application" or not e.get("Exec")
+                    or e.get("NoDisplay") == "true" or e.get("Hidden") == "true"):
+                continue
+            seen[app_id] = DesktopApp(app_id, e.get("Name", app_id), e["Exec"], e.get("Icon", ""),
+                                      e.get(WRAP_KEY) == "true")
+    return sorted((a for a in seen.values() if a), key=lambda a: a.name.lower())
+
+
+def _exec_prefix() -> str:
+    path = str(RUN_WRAPPER)
+    if re.search(r"[\s\"'\\$`]", path):     # кавычки по спецификации desktop entry
+        path = '"' + re.sub(r'(["`$\\])', r"\\\\\1", path) + '"'
+    return path + " "
+
+
+def wrap_desktop(text: str) -> str:
+    """Все Exec= (и в действиях ярлыка) — через обёртку; D-Bus-запуск выключен, он обошёл бы Exec."""
+    out, prefix = [], _exec_prefix()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("DBusActivatable=") or stripped.startswith(f"{WRAP_KEY}="):
+            continue
+        if stripped.startswith("Exec=") and not stripped[5:].startswith(prefix):
+            line = "Exec=" + prefix + stripped[5:]
+        out.append(line)
+        if stripped == "[Desktop Entry]":
+            out.append(f"{WRAP_KEY}=true")
+    return "\n".join(out) + "\n"
+
+
+def wrap_app(app_id: str) -> None:
+    local = LOCAL_APPS / app_id
+    if local.exists() and not _is_wrapped(local):
+        # у пользователя уже был свой ярлык: сохраняем, чтобы вернуть при снятии
+        DESKTOP_BACKUP.mkdir(parents=True, exist_ok=True)
+        (DESKTOP_BACKUP / app_id).write_bytes(local.read_bytes())
+        src = local
+    else:
+        src = DESKTOP_BACKUP / app_id
+        if not src.exists():
+            src = next((f for base in _system_app_dirs() for i, f in _desktop_files(base) if i == app_id), None)
+            if src is None:
+                raise FileNotFoundError(f"ярлык {app_id} не найден")
+    text = src.read_text(errors="replace")
+    LOCAL_APPS.mkdir(parents=True, exist_ok=True)
+    tmp = local.with_suffix(".tmp")
+    tmp.write_text(wrap_desktop(text))
+    tmp.replace(local)
+
+
+def unwrap_app(app_id: str) -> None:
+    local = LOCAL_APPS / app_id
+    if not _is_wrapped(local):
+        return
+    backup = DESKTOP_BACKUP / app_id
+    if backup.exists():
+        backup.replace(local)
+    else:
+        local.unlink()
+
+
+def wrapped_apps() -> list[str]:
+    return [i for i, f in _desktop_files(LOCAL_APPS) if _is_wrapped(f)]
+
+
+def in_apps_group() -> bool:
+    import grp
+    import pwd
+    try:
+        g = grp.getgrnam(APPS_GROUP)
+    except KeyError:
+        return False
+    user = pwd.getpwuid(os.getuid()).pw_name
+    return user in g.gr_mem or pwd.getpwuid(os.getuid()).pw_gid == g.gr_gid
 
 
 VPN_WARNING = ("Трафик сейчас идёт через VPN ({dev}). Проверки показывают работу VPN, а не обхода DPI: "
@@ -923,8 +1092,13 @@ def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
 
     tun = tun_status()
     if tun.running:
-        out(f"TUN: работает, {tun.dev} → ciadpi 127.0.0.1:{tun.port}, QUIC {tun.quic}. "
-            "Проверка «напрямую» ниже идёт через туннель, а подбор стратегий неточен.")
+        out(f"TUN: работает, {tun.dev} → ciadpi 127.0.0.1:{tun.port}, QUIC {tun.quic}, "
+            f"приложения: {TUN_SCOPES.get(tun.scope, tun.scope).lower()}.")
+        if tun.scope != "only":
+            out("   Проверка «напрямую» ниже идёт через туннель, а подбор стратегий неточен.")
+    wrapped = wrapped_apps()
+    if wrapped:
+        out(f"Приложения в списке TUN: {', '.join(wrapped)}")
     else:
         out(f"TUN: {'выключен' if TUN_HELPER.exists() else 'не установлен'}")
 
@@ -999,7 +1173,29 @@ def main() -> int:
     ap.add_argument("--voice-profile", choices=sorted(VOICE_PROFILES), help="профиль для --voice start")
     ap.add_argument("--tun", choices=("start", "stop", "status", "log"),
                     help="весь TCP через byedpi (спросит пароль sudo); стратегия и порт из конфига")
+    ap.add_argument("--tun-scope", choices=sorted(TUN_SCOPES),
+                    help="для --tun start: all, only (только из списка), except (все, кроме списка); сохраняется")
+    ap.add_argument("--apps", nargs="*", metavar="ID",
+                    help="список приложений TUN: без аргументов — показать; +id.desktop — добавить, -id.desktop — убрать")
     a = ap.parse_args()
+    if a.apps is not None:
+        for item in a.apps:
+            try:
+                if item.startswith("+"):
+                    wrap_app(item[1:])
+                elif item.startswith("-"):
+                    unwrap_app(item[1:])
+                else:
+                    print(f"Нужен + или - перед {item}", file=sys.stderr)
+                    return 2
+            except (OSError, FileNotFoundError) as e:
+                print(f"{item[1:]}: {e}", file=sys.stderr)
+                return 1
+        for app in list_desktop_apps():
+            print(f"{'[x]' if app.wrapped else '[ ]'} {app.id:45} {app.name}")
+        if not in_apps_group():
+            print(f"\n!! Пользователь не в группе {APPS_GROUP}: выполни ./install.sh tun", file=sys.stderr)
+        return 0
     if a.tun:
         if not TUN_HELPER.exists():
             print("Режим не установлен. Выполни: ./install.sh tun", file=sys.stderr)
@@ -1010,7 +1206,11 @@ def main() -> int:
             if port_busy(cfg["byedpi_port"]):
                 print(f"Порт {cfg['byedpi_port']} занят: останови byedpi в приложении.", file=sys.stderr)
                 return 1
+            if a.tun_scope:
+                cfg["tun_scope"] = a.tun_scope
+                save_cfg(cfg)
             extra = [str(cfg["byedpi_port"]), *(["--allow-quic"] if cfg.get("tun_allow_quic") else []),
+                     f"--scope={cfg.get('tun_scope', 'all')}",
                      "--", *tun_argv(cfg["byedpi_args"], cfg["fake_sni"], bool(cfg.get("ipv4_only", True)))]
         return subprocess.run(["sudo", str(TUN_HELPER), a.tun, *extra]).returncode
     if a.voice:
@@ -1020,7 +1220,7 @@ def main() -> int:
         extra = [a.voice_profile or load_cfg()["voice_profile"]] if a.voice == "start" else []
         return subprocess.run(["sudo", str(VOICE_HELPER), a.voice, *extra]).returncode
     dev, is_vpn = route_info()
-    if a.pick and tun_status().running and not a.force:
+    if a.pick and tun_blocks_picking(tun_status()) and not a.force:
         print("Работает режим TUN: временные ciadpi подбора сами пойдут через туннель, и результат "
               "будет неверным. Останови его: byedpi-tg-diag --tun stop", file=sys.stderr)
         return 2

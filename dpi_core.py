@@ -196,16 +196,18 @@ class Probe:
     code: int = 0
     size: int = 0
     secs: float = 0.0
+    detail: str = ""        # текст ошибки, чтобы отличить сломанную проверку от блокировки
 
 
-def _judge(t: Target, code: int, size: int, secs: float, err: int, handshake: float = 0) -> Probe:
+def _judge(t: Target, code: int, size: int, secs: float, err: int, handshake: float = 0,
+           detail: str = "") -> Probe:
     if err:
         reason = _CURL_REASON.get(err, "error")
         # Рукопожатие прошло, а данных нет: первая TLS-запись тоже могла не докачаться,
         # поэтому заморозка возможна и при нуле полученных байт.
         if reason in ("timeout", "reset") and (size > 0 or (handshake > 0 and not t.redirects)):
             reason = "freeze"
-        return Probe(t, False, reason, code, size, secs)
+        return Probe(t, False, reason, code, size, secs, detail[:200])
     if not code:
         return Probe(t, False, "error", code, size, secs)
     if t.min_bytes and size < t.min_bytes:
@@ -230,23 +232,25 @@ def _probe_cffi(t: Target, port: int | None, timeout: float, fingerprint: str,
     if verify is not None:
         kw["verify"] = verify
     handshake = 0.0
+    detail = ""
     with cffi_requests.Session(impersonate=fingerprint, curl_infos=[CurlInfo.APPCONNECT_TIME]) as s:
         try:
             r = s.get(t.url, timeout=timeout, allow_redirects=True, max_redirects=5,
                       content_callback=count, **kw)
             code = r.status_code
         except Exception as e:      # curl_cffi поднимает свои типы ошибок с кодом libcurl
+            detail = f"{type(e).__name__}: {e}".replace("\n", " ")
             err = getattr(e, "code", 0) or -1
             if not isinstance(err, int):
                 err = int(getattr(err, "value", -1))
             r = getattr(e, "response", None)
             if r is not None:
                 handshake = float((r.infos or {}).get(CurlInfo.APPCONNECT_TIME, 0) or 0)
-    return _judge(t, code, size[0], time.monotonic() - start, err, handshake)
+    return _judge(t, code, size[0], time.monotonic() - start, err, handshake, detail)
 
 
 def _probe_curl(t: Target, port: int | None, timeout: float, extra: list[str] | None = None) -> Probe:
-    cmd = ["curl", "-s", "-L", "--max-redirs", "5", "-o", "/dev/null",
+    cmd = ["curl", "-sS", "-L", "--max-redirs", "5", "-o", "/dev/null",
            "-w", "%{http_code} %{size_download} %{time_appconnect}", "-m", str(timeout), *(extra or [])]
     if port and not extra:
         cmd += ["-x", f"socks5h://127.0.0.1:{port}"]
@@ -261,7 +265,8 @@ def _probe_curl(t: Target, port: int | None, timeout: float, extra: list[str] | 
         code = int(parts[0]) if parts else 0
         size = int(parts[1]) if len(parts) > 1 else 0
         handshake = float(parts[2]) if len(parts) > 2 else 0.0
-        return _judge(t, code, size, time.monotonic() - start, r.returncode, handshake)
+        detail = (r.stderr.strip().splitlines() or [""])[-1]
+        return _judge(t, code, size, time.monotonic() - start, r.returncode, handshake, detail)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return Probe(t, False, "timeout", secs=time.monotonic() - start)
 
@@ -291,6 +296,66 @@ def summarize(probes: list[Probe]) -> dict[str, tuple[int, int]]:
         s[0] += p.ok
         s[1] += 1
     return {k: (v[0], v[1]) for k, v in scores.items()}
+
+
+# ─────────────────────────── контрольные сайты ───────────────────────────
+#
+# Если все стратегии дают 0, дело обычно не в стратегиях. Контроль отвечает на вопросы:
+# есть ли интернет вообще, открывается ли зарубежное (или оператор пропускает только «белый
+# список»), работает ли ciadpi как обычный прокси и не сломана ли сама проверка.
+
+CONTROL_TARGETS = [
+    Target("control", "ya.ru", "https://ya.ru/"),
+    Target("control", "example.com", "https://example.com/"),
+    Target("control", "Cloudflare 128К", "https://speed.cloudflare.com/__down?bytes=131072", 128 * 1024),
+]
+
+
+@dataclass
+class ControlResult:
+    direct: list[Probe]
+    proxy: list[Probe] | None     # через ciadpi без приёмов; None — ciadpi не запустился
+
+    def verdicts(self) -> list[tuple[bool, str]]:
+        """(критично?, объяснение). Критично — подбор стратегий не имеет смысла."""
+        ru, foreign, cf = self.direct
+        out: list[tuple[bool, str]] = []
+        why = lambda p: REASONS[p.reason] + (f" ({p.detail})" if p.detail else "")
+        if not ru.ok and not foreign.ok:
+            return [(True, f"Напрямую не открываются даже ya.ru и example.com: {why(ru)}. "
+                           "Нет интернета, не работает DNS или сломана сама проверка. "
+                           "Проверь в терминале: curl -sI https://ya.ru")]
+        if ru.ok and not foreign.ok:
+            out.append((True,
+                "ya.ru открывается, а обычный зарубежный example.com нет "
+                f"({why(foreign)}). Так выглядят «белые списки» оператора (часто на мобильном "
+                "интернете): пропускаются только разрешённые сайты, остальное режется по IP. "
+                "Это не фильтр по имени сайта, и byedpi здесь не поможет ни с какой стратегией. "
+                "Попробуй другую сеть (домашний Wi-Fi, другой оператор)."))
+        if self.proxy is None:
+            out.append((True, "ciadpi не запускается даже без аргументов. Переустанови: ./install.sh"))
+        else:
+            pru = self.proxy[0]
+            if ru.ok and not pru.ok:
+                out.append((True,
+                    f"Напрямую ya.ru открывается, а через ciadpi без всяких приёмов нет: {why(pru)}. "
+                    "Значит, сломан сам путь через прокси (ciadpi, его DNS или локальный файрвол), "
+                    "а не обход DPI. Все стратегии будут давать 0, пока это не исправлено."))
+        if foreign.ok and not cf.ok and cf.reason in ("freeze", "short", "timeout"):
+            out.append((False,
+                "Зарубежный Cloudflare замораживается или не отвечает: похоже, ТСПУ режет Cloudflare "
+                "по IP. Discord живёт на Cloudflare, и тогда стратегии для него могут не помочь."))
+        return out
+
+
+def check_control(timeout: float, fingerprint: str = "firefox", ipv4_only: bool = True) -> ControlResult:
+    direct = check_targets(None, CONTROL_TARGETS, timeout, fingerprint)
+    try:
+        with running_ciadpi("", "", ipv4_only) as port:
+            proxy = check_targets(port, CONTROL_TARGETS, timeout, fingerprint) if port else None
+    except OSError:          # ciadpi не установлен
+        proxy = None
+    return ControlResult(direct, proxy)
 
 
 # ─────────────────────────── запуск ciadpi ───────────────────────────
@@ -1058,9 +1123,13 @@ VPN_WARNING = ("Трафик сейчас идёт через VPN ({dev}). Пр�
 
 
 def _fmt_probe(p: Probe) -> str:
-    return (f"  {'OK ' if p.ok else 'XX '} {SERVICE_TITLES.get(p.target.service, '?'):8} "
+    title = {**SERVICE_TITLES, "control": "Контроль"}.get(p.target.service, "?")
+    line = (f"  {'OK ' if p.ok else 'XX '} {title:8} "
             f"{p.target.name:14} код={p.code or '-':<4} байт={p.size:<8} {p.secs:4.1f}с  "
             f"{'' if p.ok else REASONS[p.reason]}")
+    if not p.ok and p.detail:
+        line += f"\n        {p.detail}"
+    return line
 
 
 def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
@@ -1078,6 +1147,12 @@ def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
         ver = "НЕ НАЙДЕН"
     out(f"ciadpi: {ver}")
     out(f"Проверка TLS: {'curl_cffi, отпечаток ' + fp if cffi_requests else 'curl (менее точно, запусти install.sh)'}")
+
+    env_proxy = [k for k in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY")
+                 if os.environ.get(k)]
+    if env_proxy:
+        out(f"!! Задан системный прокси ({', '.join(env_proxy)}): проверки «напрямую» идут через него. "
+            "Сними переменную или запусти: env -u https_proxy -u http_proxy -u all_proxy byedpi-tg-diag")
 
     dev, is_vpn = route_info()
     out(f"Маршрут в интернет: {dev or 'не определён'}{' — ТУННЕЛЬ VPN' if is_vpn else ''}")
@@ -1108,6 +1183,22 @@ def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
         out(f"  {'XX ' if r.bad else 'OK '} {r.host}: система {', '.join(r.system[:3]) or '-'}; "
             f"DoH {', '.join(r.doh[:3]) or 'нет ответа'}{'; ' + r.verdict if r.bad else ''}")
 
+    out("\n== Контроль: незаблокированные сайты ==")
+    ctrl = check_control(timeout, fp, ipv4)
+    out(" напрямую:")
+    for p in ctrl.direct:
+        out(_fmt_probe(p))
+    out(" через ciadpi без приёмов (обычный прокси):")
+    for p in ctrl.proxy or []:
+        out(_fmt_probe(p))
+    if ctrl.proxy is None:
+        out("  ciadpi не запустился")
+    verdicts = ctrl.verdicts()
+    for fatal, text in verdicts:
+        out(("!! " if fatal else " * ") + text)
+    if not verdicts:
+        out("  Интернет и прокси в порядке: дальше всё зависит от стратегии.")
+
     node = discover_video_node()
     out(f"\nВидеосервер: {node or 'не определён напрямую'}")
     targets = all_targets(cfg, node)
@@ -1128,6 +1219,11 @@ def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
             for p in row_probes:
                 out(_fmt_probe(p))
 
+    if pick and any(fatal for fatal, _ in verdicts):
+        out("\n== Подбор пропущен ==")
+        out("  Контроль выше показал проблему, при которой ни одна стратегия не сработает. "
+            "Сначала исправь её, иначе подбор займёт 15 минут и даст одни нули.")
+        pick = False
     if pick:
         if not node and row_probes is not None:
             with running_ciadpi(args, sni, ipv4) as port:
@@ -1162,6 +1258,8 @@ def diagnose(cfg: dict, out: Callable[[str], None] = print, pick: bool = False,
                 out("Сохранена в конфиг. Запусти или перезапусти byedpi в приложении.")
         else:
             out("\nНи одна стратегия не прошла ни одного адреса.")
+            out("Посмотри «Частые причины отказа»: одна и та же причина у всех стратегий значит, что "
+                "мешает не DPI по имени сайта, а что-то другое (блокировка по IP, «белые списки», DNS).")
 
 
 def main() -> int:

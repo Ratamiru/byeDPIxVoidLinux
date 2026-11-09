@@ -122,6 +122,16 @@ class StrategyTester(QThread):
         ipv4 = bool(cfg.get("ipv4_only", True))
         rows, best = [], None
         try:
+            # Сначала контроль: если не работает даже обычный прокси или оператор пропускает только
+            # «белый список», подбор даст одни нули за 15 минут
+            ctrl = core.check_control(float(cfg.get("probe_timeout", 8)),
+                                      cfg.get("probe_fingerprint", "firefox"), ipv4)
+            fatal = [text for bad, text in ctrl.verdicts() if bad]
+            if fatal:
+                self.failed.emit("Подбор не запущен: проблема не в стратегиях.\n\n" + "\n\n".join(fatal)
+                                 + "\n\nПодробности: «Отчёт» на этой вкладке или byedpi-tg-diag в терминале.")
+                self.done.emit(rows, best, False)
+                return
             node = core.discover_video_node()
             if not node and self.own_args:
                 with core.running_ciadpi(self.own_args, self.sni, ipv4) as port:
